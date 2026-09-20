@@ -38,7 +38,7 @@
            border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
 
   /* ---- brand wordmark ---- */
-  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
+  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
   #brand .mark { display: flex; align-items: center; gap: 10px; }
   #brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #ffd27a, var(--accent) 60%, #d98f1f);
                  box-shadow: 0 2px 10px rgba(245,183,74,.35); position: relative; flex: none; }
@@ -49,11 +49,14 @@
   #brand .tag { font-size: 11.5px; color: var(--muted); letter-spacing: .04em; padding-left: 38px; }
 
   /* ---- HUD (top-left) ---- */
-  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 12px; width: min(360px, 34vw); min-width: 300px; }
-  #hud .card { padding: 16px 20px 18px; }
+  /* Compact: the card used to be up to 360 px wide with a 9 vw chord name and covered most of a short
+     window's height, hiding the instrument's headstock. The instrument layout also avoids this box
+     (UkeFrame.layout / V12), so any growth here costs instrument size — keep it small. */
+  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 10px; width: min(320px, 28vw); min-width: 240px; }
+  #hud .card { padding: 12px 16px 14px; }
   #hud .label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); margin-bottom: 2px; }
-  #chord { font-size: clamp(64px, 9vw, 120px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
-           padding: 4px 6px 6px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
+  #chord { font-size: clamp(44px, min(6vw, 12vh), 88px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+           padding: 2px 6px 4px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
   #chord.stale { color: var(--muted); }
   #chord.off { color: var(--accent); }
   #pos { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 1.3em; line-height: 1.3; }
@@ -175,7 +178,7 @@
     <span class="kc"><kbd>?</kbd>help</span>
     <span class="kc"><kbd>S</kbd>song</span>
     <span class="kc opt"><kbd>M</kbd>mode</span>
-    <span class="kc"><kbd>B</kbd>cap anchor</span>
+    <span class="kc opt"><kbd>A</kbd>auto-fit</span>
     <span class="kc"><kbd>K</kbd>calibrate</span>
     <span class="kc opt"><kbd>C</kbd>recentre</span>
     <span class="kc opt"><kbd>D</kbd>debug</span>
@@ -201,7 +204,7 @@
 <script type="module">
 /*__SECTIONS__*/
 // Expose the sections for DevTools / screenshot tooling (module scope is otherwise private).
-window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Anchor, Songs };
+window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Fit, Songs };
 </script>
 </body>
 </html>

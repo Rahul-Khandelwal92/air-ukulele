@@ -13,7 +13,7 @@ const sections = [
   ['chord/',    'chord.js'],
   ['uke/ + strum/', 'strum.js'],
   ['annot/',    'annot.js'],
-  ['anchor/',   'anchor.js'],
+  ['fit/',      'fit.js'],
   ['songs/',    'songs.js'],
   ['main',      'main.js'],
 ];

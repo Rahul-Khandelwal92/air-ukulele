@@ -13,8 +13,8 @@ const header = `<!--
        (Google MediaPipe, ~17 MB) loads from its official CDN and is then cached by the browser.
     2. Click "Start — camera + sound" and allow the camera.
     3. Left hand in the left half of the screen makes the chord shape; right index finger sweeps
-       across the strings to strum. Press ? for chord help, S for the Rasputin practice song,
-       B then click a blue pen cap on your shirt to make the instrument follow you, V for the self-test.
+       across the strings to strum. Hold both hands still for two seconds and the ukulele sizes and
+       places itself to your hands. Press ? for chord help, S for the Rasputin practice song, V for the self-test.
     Keyboard fallback without a camera: Q W E R = C G Am F, Space = strum, 1–4 = pluck a string.
 
   WHAT IS INSIDE (no samples, no frameworks, nothing else external)
@@ -22,9 +22,9 @@ const header = `<!--
     · MediaPipe two-hand tracking; roles assigned by screen side; cover-crop mapping to the display
     · Chord recognition from finger curl in a hand-normalised frame (rules), optional 15 s calibration
     · Sub-frame strum detection: crossing times solved between camera frames, plucks scheduled with the real rake
-    · Blue-cap body anchor (HSV blob tracking), on-instrument fingering annotations, help panel, song practice mode
+    · Hands-free fit: instrument sized from your palm and placed between your hands, on-instrument fingering annotations, help panel, song practice mode
     · Self-test (append ?selftest=1 or press V): every note verified against real ukulele pitch within 3 cents,
-      chord recogniser, strum timing, song data, anchor detector and annotations all checked with printed results
+      chord recogniser, strum timing, song data, auto-fit, layout and annotations all checked with printed results
 -->
 `;
 

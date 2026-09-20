@@ -28,8 +28,12 @@ const Chord = (() => {
     // knuckle) or closer. curl maps that ratio linearly onto [0,1].
     extRatio: 1.8,
     curlRatio: 1.0,
-    // a finger counts as DOWN (fretting) above this curl
+    // a finger counts as DOWN (fretting) above this curl (centre of the band)
     downThreshold: 0.35,
+    // Hysteresis half-width: a finger flips to DOWN only above thr+hyst (0.40) and back
+    // to UP only below thr-hyst (0.30). Inside the band it keeps its previous state, so a
+    // fingertip hovering at the threshold cannot flicker the chord frame to frame.
+    hysteresis: 0.05,
     // per-dimension std floor for the calibrated classifier (normalised units)
     stdFloor: 0.02,
   };
@@ -88,16 +92,30 @@ const Chord = (() => {
     { down: [1, 1, 1, 1], chord: 'mute' },
   ];
 
-  function classifyRules(c) {
-    const thr = params.downThreshold;
-    const down = FINGER_NAMES.map(f => (c[f] > thr ? 1 : 0));
+  // prevDown: previous frame's down flags [index,middle,ring,pinky] (0/1) or null.
+  // With no history the centre threshold decides; with history the band applies.
+  function fingerDown(curl, prev) {
+    const thr = params.downThreshold, h = params.hysteresis;
+    if (prev == null) return curl > thr ? 1 : 0;
+    if (curl > thr + h) return 1;
+    if (curl < thr - h) return 0;
+    return prev ? 1 : 0;
+  }
+  function classifyRules(c, prevDown = null) {
+    const thr = params.downThreshold, h = params.hysteresis;
+    const down = FINGER_NAMES.map((f, i) => fingerDown(c[f], prevDown ? prevDown[i] : null));
+    // confidence = how far the least certain finger sits outside the hysteresis band,
+    // mapped so a finger at curl 0 or 0.7+ reads 1 and a finger inside the band reads 0.
     let conf = 1;
-    for (const f of FINGER_NAMES) conf = Math.min(conf, Math.abs(c[f] - thr) / thr);
+    for (const f of FINGER_NAMES) {
+      const d = Math.max(0, Math.abs(c[f] - thr) - h);
+      conf = Math.min(conf, d / (thr - h));
+    }
     conf = clamp01(conf);
     for (const r of RULES) {
-      if (r.down.every((d, i) => d === down[i])) return { chord: r.chord, confidence: conf };
+      if (r.down.every((d, i) => d === down[i])) return { chord: r.chord, confidence: conf, down };
     }
-    return { chord: null, confidence: 0 };
+    return { chord: null, confidence: 0, down };
   }
 
   // ---- calibration store ----------------------------------------------------
@@ -207,14 +225,15 @@ const Chord = (() => {
     return nearest(normalize(lm), store.models());
   }
 
-  function classify(lm, store = calib) {
+  // prevDown: the `down` array returned by the previous call (rules hysteresis); pass null to reset.
+  function classify(lm, store = calib, prevDown = null) {
     const c = curls(lm);
     if (store.has()) {
       const r = classifyCalibrated(lm, store);
-      return { chord: r.chord, confidence: r.confidence, curls: c, method: 'calib' };
+      return { chord: r.chord, confidence: r.confidence, curls: c, method: 'calib', down: null };
     }
-    const r = classifyRules(c);
-    return { chord: r.chord, confidence: r.confidence, curls: c, method: 'rules' };
+    const r = classifyRules(c, prevDown);
+    return { chord: r.chord, confidence: r.confidence, curls: c, method: 'rules', down: r.down };
   }
 
   // ---- temporal voter -------------------------------------------------------
@@ -326,6 +345,27 @@ const Chord = (() => {
       lines.push(`${ok ? 'PASS' : 'FAIL'} invariance mirror+40°: max curl Δ ${curlErr.toFixed(3)}, max frame Δ ${frameErr.toFixed(3)}`);
     }
 
+    // (a'') hysteresis: a ring curl inside the band keeps its previous state, outside it flips
+    {
+      const thr = params.downThreshold, h = params.hysteresis;
+      const mk = ring => ({ index: 0.05, middle: 0.05, ring, pinky: 0.05 });
+      const UP = [0, 0, 0, 0], DOWN = [0, 0, 1, 0];
+      const cases = [
+        [mk(thr + h * 0.6), UP,   'open', 'in band, was up   → stays open'],
+        [mk(thr + h * 0.6), DOWN, 'C',    'in band, was down → stays C'],
+        [mk(thr - h * 0.6), DOWN, 'C',    'in band, was down → stays C'],
+        [mk(thr + h * 1.4), UP,   'C',    'above band        → flips to C'],
+        [mk(thr - h * 1.4), DOWN, 'open', 'below band        → flips to open'],
+        [mk(thr + h * 0.6), null, 'C',    'no history        → centre threshold'],
+      ];
+      for (const [c, prev, want, label] of cases) {
+        const res = classifyRules(c, prev);
+        const ok = res.chord === want;
+        if (!ok) pass = false;
+        lines.push(`${ok ? 'PASS' : 'FAIL'} hysteresis ring=${c.ring.toFixed(2)} ${label} (got ${res.chord})`);
+      }
+    }
+
     // (b) calibration: stored store, or a synthetic one on request
     let store = calib.has() ? calib : null;
     if (!store && opts.syntheticCalib) {
@@ -363,7 +403,7 @@ const Chord = (() => {
 
   return {
     params, FINGER_NAMES, LABEL_DOWN,
-    normalize, curls, classifyRules, classifyCalibrated, classify,
+    normalize, curls, fingerDown, classifyRules, classifyCalibrated, classify,
     calib, createCalib, createVoter,
     syntheticHand, rotateHand, mirrorHand, selfTest,
   };

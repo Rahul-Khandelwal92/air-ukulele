@@ -373,7 +373,7 @@ const Annot = (() => {
         container.appendChild(row);
       });
       const foot = document.createElement('div'); foot.className = 'hfoot';
-      foot.textContent = 'Right hand: sweep the index finger across the strings · B: click the blue cap to anchor · S: song · ?: hide';
+      foot.textContent = 'Right hand: sweep the index finger across the strings · hold both hands still 2 s to fit the uke to you (C recentres) · S: song · ?: hide';
       container.appendChild(foot);
       container.dataset.annotBuilt = '1';
     }

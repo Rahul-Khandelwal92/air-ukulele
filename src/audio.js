@@ -15,11 +15,24 @@ class StringVoice {
     this.delay = 100;                 // fractional delay N (samples). N = fs/f0 - 0.5
     this.rho = 0.993;                 // loop gain per period. 0.993 -> nylon uke rings ~1-2 s; 0.9 = palm mute
     this.hz = 0;
-    this.burstLeft = 0;               // remaining excitation samples
+    this.burstLeft = 0;               // remaining noise samples (one period)
+    this.excLeft = 0;                 // remaining excitation samples incl. the comb tail (N + M)
     this.burstAmp = 0;
-    this.lp = 0;                      // one-pole lowpass state for the excitation
-    // 6 kHz cutoff: a fingertip cannot excite the string much above this; removes fizz
+    this.lp = 0; this.lp2 = 0;        // two cascaded one-pole lowpass stages for the excitation (12 dB/oct)
+    // Excitation lowpass cutoff is set per pluck from velocity (see pluck): a soft pluck leaves a
+    // rounded initial displacement (few high harmonics), a hard one a sharp corner (many).
     this.lpA = 1 - Math.exp(-2 * Math.PI * 6000 / fs);
+    // Pick-position comb: the string is plucked at PICK_POS of its length, which cannot excite
+    // the harmonics with a node there (k = 5, 10, ... for 1/5). x[n] - x[n - M], M = PICK_POS * N.
+    // A uke is strummed roughly a fifth of the way from the bridge (soundhole edge).
+    this.pickPos = 0.2;
+    this.combM = 0;
+    this.exc = new Float32Array(1024); // excitation history for the comb (M <= 0.2 * N < 1024)
+    this.ew = 0;
+    // Chord-change damping: strings whose fret changes are muted by the lifting finger for a
+    // short time (a released fretted string stops within ~50-80 ms on a real uke).
+    this.dampLeft = 0;
+    this.rhoDamp = 0.9;
   }
   setFreq(hz) {
     this.hz = hz;
@@ -29,13 +42,24 @@ class StringVoice {
   }
   pluck(velocity) {
     this.burstLeft = Math.round(this.delay);   // classic KS: excitation length = one period
-    this.burstAmp = 0.6 * velocity;            // 0.6 keeps a 4-string strum under the limiter knee
-    this.lp = 0;
+    this.combM = Math.max(1, Math.round(this.pickPos * this.delay));
+    this.excLeft = this.burstLeft + this.combM;
+    // 0.6 keeps a 4-string strum under the limiter knee; 0.7 offsets the comb's +3 dB noise gain.
+    this.burstAmp = 0.6 * 0.7 * velocity;
+    // Brightness follows velocity: 1.5 kHz + 6.5 kHz * v -> 3.5 kHz at the 0.3 floor, 6.7 kHz at the
+    // 0.8 keyboard default (close to the old fixed 6 kHz), 8 kHz at 1.0.
+    const fc = 1500 + 6500 * Math.min(1, Math.max(0, velocity));
+    this.lpA = 1 - Math.exp(-2 * Math.PI * fc / this.fs);
+    this.lp = 0; this.lp2 = 0;
+    this.exc.fill(0);
+    this.dampLeft = 0;                          // a fresh pluck always rings at full rho
     // Deterministic noise per pluck (xorshift32): same pluck → same waveform, so V2 is reproducible
     // and no random burst can hand the octave to the 2nd harmonic in one run and not the next.
     this.pluckCount = (this.pluckCount || 0) + 1;
     this.rng = (0x9E3779B9 ^ (Math.round(this.delay) * 2654435761) ^ (this.pluckCount * 40503)) >>> 0 || 1;
   }
+  // Mute the ringing string for ms milliseconds (finger released or laid across the string).
+  damp(ms) { this.dampLeft = Math.round(ms * this.fs / 1000); }
   noise() {
     let x = this.rng; x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
     this.rng = x;
@@ -53,12 +77,24 @@ class StringVoice {
     const xD  = (1 - fD) * b[i0] + fD * b[i1];   // x[n-D]
     const xD1 = (1 - fD) * b[i1] + fD * b[i2];   // x[n-D-1]
     // Loop filter: rho * 0.5 * (x[n-D] + x[n-D-1]) — lowpass so high harmonics decay faster (like a real string)
-    let y = this.rho * 0.5 * (xD + xD1);
-    if (this.burstLeft > 0) {
-      const n = this.noise();
-      this.lp += this.lpA * (n - this.lp);
-      y += this.burstAmp * this.lp;
-      this.burstLeft--;
+    let rho = this.rho;
+    if (this.dampLeft > 0) { rho = this.rhoDamp; this.dampLeft--; }
+    let y = rho * 0.5 * (xD + xD1);
+    if (this.excLeft > 0) {
+      let e = 0;
+      if (this.burstLeft > 0) {
+        const n = this.noise();
+        this.lp += this.lpA * (n - this.lp);
+        this.lp2 += this.lpA * (this.lp - this.lp2);
+        e = this.lp2;
+        this.burstLeft--;
+      }
+      // comb: e[n] - e[n - M]
+      const ex = this.exc, EL = ex.length, ew = this.ew;
+      ex[ew] = e;
+      y += this.burstAmp * (e - ex[(ew - this.combM + EL) % EL]);
+      this.ew = (ew + 1) % EL;
+      this.excLeft--;
     }
     b[w] = y;
     this.w = (w + 1) % L;
@@ -102,6 +138,7 @@ class UkeProcessor extends AudioWorkletProcessor {
     this.mute = false;
     this.rho = 0.993;                 // normal ring
     this.rhoMute = 0.9;               // palm mute: dies in ~50 periods (~0.1 s)
+    this.dampMs = 80;                 // chord change: released strings damped for 80 ms (~20-35 periods at rho 0.9)
     this.strings = [0, 1, 2, 3].map(() => new StringVoice(sampleRate));
     this.queue = [];                  // pending plucks {when, string, velocity}
     // Body: ~300 Hz Helmholtz air resonance of a soprano uke body (Q3, +5 dB),
@@ -129,9 +166,14 @@ class UkeProcessor extends AudioWorkletProcessor {
                           velocity: Math.min(1, Math.max(0, +m.velocity || 0)) });
         break;
       case 'setChord':
-        if (Array.isArray(m.frets) && m.frets.length === 4) this.frets = m.frets.slice();
+        if (Array.isArray(m.frets) && m.frets.length === 4) {
+          // A finger lifting off (or landing on) a ringing string stops it; untouched strings ring on.
+          for (let i = 0; i < 4; i++) if (m.frets[i] !== this.frets[i]) this.strings[i].damp(this.dampMs);
+          this.frets = m.frets.slice();
+        }
         break;
       case 'setMute':
+        if (m.mute && !this.mute) for (const s of this.strings) s.damp(this.dampMs);   // fingers laid across all four
         this.mute = !!m.mute;
         break;
       case 'setTuning':
@@ -141,6 +183,8 @@ class UkeProcessor extends AudioWorkletProcessor {
         if (typeof m.rho === 'number') this.rho = m.rho;
         if (typeof m.rhoMute === 'number') this.rhoMute = m.rhoMute;
         if (typeof m.master === 'number') this.master = m.master;
+        if (typeof m.dampMs === 'number') this.dampMs = m.dampMs;
+        if (typeof m.pickPos === 'number') for (const s of this.strings) s.pickPos = Math.min(0.45, Math.max(0.05, m.pickPos));
         break;
     }
   }
@@ -415,6 +459,24 @@ const AudioEngine = (() => {
         m.harmonics.map(h => (h.present ? '2f 3f'.split(' ')[h.n - 2] : '--')).join(' ') +
         '  decay ' + (decayOk ? 'ok' : 'NO') + ' (' + early.toFixed(3) + '->' + late.toFixed(3) + ')'
       );
+    }
+    // Brightness: a hard pluck must carry more energy above 2 kHz (relative to below) than a soft one.
+    {
+      const hfRatio = (x) => {
+        const seg = x.subarray(Math.round(0.02 * sr), Math.round(0.27 * sr));
+        const npad = 16384, re = new Float32Array(npad), im = new Float32Array(npad);
+        for (let i = 0; i < seg.length && i < npad; i++) re[i] = seg[i];
+        fft(re, im);
+        let lo = 0, hi = 0;
+        const kSplit = Math.round(2000 / (sr / npad));
+        for (let k = 1; k < npad / 2; k++) { const m2 = re[k] * re[k] + im[k] * im[k]; if (k < kSplit) lo += m2; else hi += m2; }
+        return hi / Math.max(1e-20, lo);
+      };
+      const soft = hfRatio(await renderOne(Tuning.CHORDS.open, 3, 0.3, sr, 0.3));
+      const hard = hfRatio(await renderOne(Tuning.CHORDS.open, 3, 1.0, sr, 0.3));
+      const ok = hard > soft * 1.5;
+      if (!ok) pass = false;
+      lines.push((ok ? 'PASS' : 'FAIL') + ' brightness: HF/LF energy A4 soft(v=0.3) ' + soft.toExponential(2) + '  hard(v=1.0) ' + hard.toExponential(2) + '  (hard > 1.5x soft)');
     }
     lines.unshift(pass ? 'V2 PITCH OK' : 'V2 PITCH FAILED');
     return { pass, lines };

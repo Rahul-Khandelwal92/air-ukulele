@@ -51,11 +51,84 @@ const UkeFrame = (() => {
     const dy = p.y - state.bridge.y;
     return { x: dx * u.x + dy * u.y, y: dx * v.x + dy * v.y };
   }
-  function toScreen(l) {
-    const { u, v } = axes();
+  // Same transform for an arbitrary geometry object (used by layout() before committing to state).
+  function toScreenG(g, l) {
+    const a = (g.angleDeg * Math.PI) / 180;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
     const ix = l.x * u.x + l.y * v.x;
     const iy = l.x * u.y + l.y * v.y;
-    return { x: state.bridge.x + ix / state.aspect, y: state.bridge.y + iy };
+    return { x: g.bridge.x + ix / g.aspect, y: g.bridge.y + iy };
+  }
+  function toScreen(l) { return toScreenG(state, l); }
+
+  // ---- layout: keep the whole instrument clear of the HUD and panels ---------------------------
+  // Local-space box enclosing everything drawn for the instrument INCLUDING the annotation layer:
+  // body tail −0.16L … headstock end 1.17L along the neck; body ±3.15·s, fret numbers to +2.8·s and
+  // the hand-glyph plate above the neck to about −7.5·s across it. Multiples of L (x) and spacing (y).
+  const EXTENT = { x0: -0.18, x1: 1.19, y0: -7.6, y1: 3.6 };
+  function boundsOf(g = state) {
+    const pts = [[EXTENT.x0, EXTENT.y0], [EXTENT.x1, EXTENT.y0], [EXTENT.x0, EXTENT.y1], [EXTENT.x1, EXTENT.y1]]
+      .map(([kx, ky]) => toScreenG(g, { x: kx * g.length, y: ky * g.spacing }));
+    return { x0: Math.min(...pts.map(p => p.x)), y0: Math.min(...pts.map(p => p.y)),
+             x1: Math.max(...pts.map(p => p.x)), y1: Math.max(...pts.map(p => p.y)) };
+  }
+  const intersects = (a, b) => a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+  const insideViewport = b => b.x0 >= 0 && b.y0 >= 0 && b.x1 <= 1 && b.y1 <= 1;
+
+  // Default placement: body right of centre at chest height, neck rising up-left at −18°.
+  const LAYOUT_DEFAULT = { bridge: { x: 0.64, y: 0.62 }, angleDeg: -18 };
+  // Search space when the default collides: bridge grid (normalised), neck angles from the default
+  // down to level (a flatter neck is narrower), scale steps down to 0.6 (below that the fret spaces
+  // are smaller than a fingertip and position play stops working). Tilt is worth more than size: a
+  // tilted neck is how a ukulele is held, so the requested angle is kept down to scale 0.76 before
+  // the neck is flattened (20 Sept: the level, full-size neck in the user's screenshot read as wrong).
+  const LAYOUT_BX = [0.50, 0.90, 0.02], LAYOUT_BY = [0.40, 0.86, 0.02];
+  const LAYOUT_ANGLES = a => [a, a / 2, 0];
+  const LAYOUT_SCALES = [1, 0.92, 0.84, 0.76, 0.68, 0.6];
+  const LAYOUT_MIN_SCALE_TILTED = 0.76;
+  // The strum zone must stay in the right half: roles are assigned by screen side, so a strumming
+  // hand working left of the midline would be taken for the fretting hand.
+  const zoneMidX = g => toScreenG(g, { x: 0.25 * g.length, y: 0 }).x;
+  const overlapArea = (a, b) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+
+  // Pure. Given the canvas aspect, the unscaled base size and obstacle rects (normalised screen
+  // coords, e.g. the HUD card, the status bar, open side panels), return a geometry whose bounds
+  // sit inside the viewport and touch no obstacle, with the strum zone in the right half. Prefers
+  // the default; otherwise the nearest bridge position at the largest scale (then the steepest
+  // angle) that fits. If nothing fits, the least-overlapping smallest placement with `ok:false`.
+  function layout({ aspect = 1, base, avoid = [], defaults = LAYOUT_DEFAULT } = {}) {
+    const mk = (bx, by, k, ang) => ({ aspect, bridge: { x: bx, y: by }, angleDeg: ang, length: base.length * k, spacing: base.spacing * k });
+    const clear = g => { const b = boundsOf(g); return insideViewport(b) && !avoid.some(r => intersects(b, r)); };
+    const fits = g => zoneMidX(g) >= 0.5 && clear(g);
+    const g0 = mk(defaults.bridge.x, defaults.bridge.y, 1, defaults.angleDeg);
+    if (fits(g0)) return { ...g0, ok: true, scale: 1, moved: false };
+    const cands = [];
+    for (let by = LAYOUT_BY[0]; by <= LAYOUT_BY[1] + 1e-9; by += LAYOUT_BY[2]) {
+      for (let bx = LAYOUT_BX[0]; bx <= LAYOUT_BX[1] + 1e-9; bx += LAYOUT_BX[2]) {
+        cands.push({ bx, by, d: Math.hypot((bx - defaults.bridge.x) * aspect, by - defaults.bridge.y) });
+      }
+    }
+    cands.sort((a, b) => a.d - b.d);
+    for (const ang of LAYOUT_ANGLES(defaults.angleDeg)) {
+      for (const k of LAYOUT_SCALES) {
+        if (ang !== 0 && k < LAYOUT_MIN_SCALE_TILTED) break;
+        for (const c of cands) { const g = mk(c.bx, c.by, k, ang); if (fits(g)) return { ...g, ok: true, scale: k, moved: true }; }
+      }
+    }
+    // Nothing fits: take the smallest instrument with the least UI overlap (still right-half, still inside).
+    let best = null, bestCost = Infinity;
+    const kMin = LAYOUT_SCALES[LAYOUT_SCALES.length - 1];
+    for (const ang of LAYOUT_ANGLES(defaults.angleDeg)) {
+      for (const c of cands) {
+        const g = mk(c.bx, c.by, kMin, ang);
+        if (zoneMidX(g) < 0.5) continue;
+        const b = boundsOf(g);
+        if (!insideViewport(b)) continue;
+        const cost = avoid.reduce((s, r) => s + overlapArea(b, r), 0);
+        if (cost < bestCost) { bestCost = cost; best = g; }
+      }
+    }
+    return { ...(best || g0), ok: false, scale: best ? kMin : 1, moved: !!best };
   }
 
   function stringLocalYs() {
@@ -84,26 +157,46 @@ const UkeFrame = (() => {
   // top string (on the "armed" side of the string band): a resting hand recentred with C
   // must not be parked on a string line, or jitter would pluck it.
   const RECENTER_TIP_Y = spacing => -(1.5 + 2.5) * spacing;
-  function recenter(frettingWrist, strummingTip) {
-    if (!frettingWrist || !strummingTip) return get();
-    const ax = (frettingWrist.x - strummingTip.x) * state.aspect;
-    const ay = frettingWrist.y - strummingTip.y;
+  // A ukulele is held with the neck rising toward the fretting hand: 12°–40° above level (players sit
+  // around 15°–25°). Level or neck-down never happens on a real instrument, so the tilt is clamped to
+  // this range even when the hands are level: the nut then sits ≤ 0.1 frame heights above the fretting
+  // knuckles, well within the reach of the fingers, and the coaching arrows guide the hand up.
+  const TILT_MIN_DEG = -12, TILT_MAX_DEG = -40;
+  // Pure: the recentred geometry for an arbitrary geometry g (its length/spacing/aspect are kept).
+  // `frettingAim` is where the neck should pass: the fretting hand's knuckles (middle MCP, landmark 9)
+  // in live use, so the fingers curl down onto the strings like on a real neck.
+  function recenterG(g, frettingAim, strummingTip) {
+    const out = { aspect: g.aspect, bridge: { ...g.bridge }, angleDeg: g.angleDeg, length: g.length, spacing: g.spacing };
+    if (!frettingAim || !strummingTip) return out;
+    const ax = (frettingAim.x - strummingTip.x) * g.aspect;
+    const ay = frettingAim.y - strummingTip.y;
     const n = Math.hypot(ax, ay);
-    if (n < 1e-6) return get();
+    if (n < 1e-6) return out;
     const ux = ax / n, uy = ay / n;
-    // u = (−cos a, sin a)  ⇒  a = atan2(uy, −ux); clamp to a sane playing tilt
+    // u = (−cos a, sin a)  ⇒  a = atan2(uy, −ux); negative = headstock rises up-left
     let a = Math.atan2(uy, -ux);
-    const lim = (40 * Math.PI) / 180;
-    a = Math.max(-lim, Math.min(lim, a));
-    state.angleDeg = (a * 180) / Math.PI;
-    const { u, v } = axes();
-    const d = 0.25 * state.length, ty = RECENTER_TIP_Y(state.spacing);
+    a = Math.min((TILT_MIN_DEG * Math.PI) / 180, Math.max((TILT_MAX_DEG * Math.PI) / 180, a));
+    out.angleDeg = (a * 180) / Math.PI;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
+    const d = 0.25 * g.length, ty = RECENTER_TIP_Y(g.spacing);
     // tip_local = (d, ty)  ⇒  bridge = tip − (d·u + ty·v) in iso coords
-    state.bridge = {
-      x: strummingTip.x - (d * u.x + ty * v.x) / state.aspect,
+    out.bridge = {
+      x: strummingTip.x - (d * u.x + ty * v.x) / g.aspect,
       y: strummingTip.y - (d * u.y + ty * v.y),
     };
+    return out;
+  }
+  function recenter(frettingWrist, strummingTip) {
+    const g = recenterG(state, frettingWrist, strummingTip);
+    state.angleDeg = g.angleDeg; state.bridge = g.bridge;
     return get();
+  }
+  // Pure inverse of toScreenG for an arbitrary geometry.
+  function toLocalG(g, p) {
+    const a = (g.angleDeg * Math.PI) / 180;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
+    const dx = (p.x - g.bridge.x) * g.aspect, dy = p.y - g.bridge.y;
+    return { x: dx * u.x + dy * u.y, y: dx * v.x + dy * v.y };
   }
 
   // Appearance only — geometry lives above. Tweak freely.
@@ -308,8 +401,62 @@ const UkeFrame = (() => {
     ctx.restore();
   }
 
-  return { set, get, toLocal, toScreen, stringLocalYs, stringScreenSegments,
-           strumZone, neckZone, recenter, RECENTER_TIP_Y, draw, theme };
+  // -------------------------------------------------------------- V12 self-test (layout)
+  // The instrument must never sit under the HUD, the status bar or an open side panel, on any
+  // plausible window. Obstacles are modelled in CSS pixels like the real DOM: HUD card top-left
+  // (24 px inset, width min(320 px, 28 vw), up to 480 px tall), status bar 40 px along the bottom,
+  // and optionally a 300 px right-hand panel (help / song).
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push(`${ok ? 'PASS' : 'FAIL'} ${msg}`); };
+    const viewports = [[1920, 1080], [1665, 663], [1536, 864], [1366, 768], [1280, 720], [1024, 640], [2560, 1080], [1280, 1024]];
+    const baseFor = aspect => ({ length: Math.min(0.66, 0.38 * aspect), spacing: 0.05 });
+    const px = (W, H, x, y, w, h, pad = 12) => ({ x0: (x - pad) / W, y0: (y - pad) / H, x1: (x + w + pad) / W, y1: (y + h + pad) / H });
+    const fmt = b => `[${b.x0.toFixed(2)},${b.y0.toFixed(2)}]–[${b.x1.toFixed(2)},${b.y1.toFixed(2)}]`;
+    for (const [W, H] of viewports) {
+      const aspect = W / H, base = baseFor(aspect);
+      const hudW = Math.min(320, 0.28 * W), hudH = Math.min(480, 0.8 * H - 24);
+      const hud = px(W, H, 24, 24, hudW, hudH), status = px(W, H, 0, H - 40, W, 40);
+      for (const panel of [null, px(W, H, W - 324, 24, 300, H - 120)]) {
+        const avoid = [hud, status].concat(panel ? [panel] : []);
+        const g = layout({ aspect, base, avoid });
+        const b = boundsOf(g);
+        const hit = avoid.filter(r => intersects(b, r)).length;
+        const zoneMid = toScreenG(g, { x: 0.25 * g.length, y: 0 });
+        check(g.ok && hit === 0 && insideViewport(b),
+          `${W}×${H}${panel ? ' +panel' : ''}: instrument ${fmt(b)} clear of ${avoid.length} obstacles, scale ${g.scale}${g.moved ? ` bridge (${g.bridge.x.toFixed(2)},${g.bridge.y.toFixed(2)})` : ' default'}`);
+        check(zoneMid.x > 0.5, `${W}×${H}${panel ? ' +panel' : ''}: strum zone stays in the right half (x ${zoneMid.x.toFixed(2)})`);
+      }
+    }
+    // a collision must cost size before it costs tilt: a 300 px panel on 1920×1080 → still −18°, smaller
+    {
+      const W = 1920, H = 1080, aspect = W / H;
+      const hud = px(W, H, 24, 24, Math.min(320, 0.28 * W), Math.min(480, 0.8 * H - 24)), status = px(W, H, 0, H - 40, W, 40), panel = px(W, H, W - 324, 24, 300, H - 120);
+      const g = layout({ aspect, base: baseFor(aspect), avoid: [hud, status, panel] });
+      check(g.ok && g.angleDeg === LAYOUT_DEFAULT.angleDeg, `cramped 1920×1080 +panel keeps the ${LAYOUT_DEFAULT.angleDeg}° tilt (got ${g.angleDeg}°, scale ${g.scale})`);
+    }
+    // no obstacles → default geometry untouched
+    const free = layout({ aspect: 16 / 9, base: baseFor(16 / 9), avoid: [] });
+    check(free.ok && !free.moved && free.scale === 1 && free.bridge.x === LAYOUT_DEFAULT.bridge.x && free.bridge.y === LAYOUT_DEFAULT.bridge.y, 'no obstacles → default placement');
+    // an obstacle covering the whole screen → reported, not silently accepted
+    const blocked = layout({ aspect: 16 / 9, base: baseFor(16 / 9), avoid: [{ x0: 0, y0: 0, x1: 1, y1: 1 }] });
+    check(!blocked.ok, 'impossible layout is reported as ok:false');
+    // bounds really enclose the drawn extents: strings, headstock end, body tail, glyph
+    {
+      const g = { aspect: 16 / 9, bridge: { x: 0.64, y: 0.62 }, angleDeg: -18, length: 0.66, spacing: 0.05 };
+      const b = boundsOf(g);
+      const probes = [{ x: 0, y: -0.075 }, { x: 0.66, y: 0.075 }, { x: -0.16 * 0.66, y: 0 }, { x: 1.17 * 0.66, y: 0 }, { x: 0.78 * 0.66, y: -7.2 * 0.05 }, { x: 0.5 * 0.66, y: 3.15 * 0.05 }];
+      const inside = probes.every(l => { const p = toScreenG(g, l); return p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1; });
+      check(inside, 'boundsOf() encloses bridge, nut, tail, headstock, glyph and body probes');
+    }
+    lines.unshift(pass ? 'V12 LAYOUT OK' : 'V12 LAYOUT FAILED');
+    return { pass, lines };
+  }
+
+  return { set, get, toLocal, toLocalG, toScreen, toScreenG, stringLocalYs, stringScreenSegments,
+           strumZone, neckZone, recenter, recenterG, RECENTER_TIP_Y, TILT_MIN_DEG, TILT_MAX_DEG, draw, theme,
+           boundsOf, intersects, layout, LAYOUT_DEFAULT, EXTENT, selfTest };
 })();
 
 // ============================================================================
@@ -585,7 +732,7 @@ const Strum = (() => {
       }
       check(err2 < 1e-9, `(f) round trip with aspect 16:9 max error ${err2.toExponential(2)}`);
       // recenter puts the tip inside the strum zone, above the top string on the armed side
-      const tip = { x: 0.7, y: 0.6 }, wrist = { x: 0.3, y: 0.5 };
+      const tip = { x: 0.7, y: 0.6 }, wrist = { x: 0.3, y: 0.40 };   // fretting knuckles up-left of the tip: −15.7° neck, inside the clamp
       UkeFrame.recenter(wrist, tip);
       const lt = UkeFrame.toLocal(tip);
       const [z0, z1] = UkeFrame.strumZone();
@@ -593,7 +740,12 @@ const Strum = (() => {
       check(Math.abs(lt.y - wantY) < 1e-9 && lt.y < topY - 0.3 * spacing && lt.x > z0 && lt.x < z1,
         `(f) recenter(): tip at local (${lt.x.toFixed(3)}, ${lt.y.toFixed(3)}) inside zone [${z0.toFixed(3)}, ${z1.toFixed(3)}], clear of the top string (${topY.toFixed(3)})`);
       const lw = UkeFrame.toLocal(wrist);
-      check(Math.abs(lw.y - wantY) < 1e-6 && lw.x > lt.x, `(f) recenter(): neck aims at wrist (wrist local y ${lw.y.toFixed(3)} = tip y)`);
+      check(Math.abs(lw.y - wantY) < 1e-6 && lw.x > lt.x, `(f) recenter(): neck aims at the fretting knuckles (local y ${lw.y.toFixed(3)} = tip y, angle ${UkeFrame.get().angleDeg.toFixed(1)}°)`);
+      // level hands still give a tilted neck; a neck-down pose is clamped to the same floor
+      const gl = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.6 }, tip), gd = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.8 }, tip);
+      check(Math.abs(gl.angleDeg - UkeFrame.TILT_MIN_DEG) < 1e-9 && Math.abs(gd.angleDeg - UkeFrame.TILT_MIN_DEG) < 1e-9, `(f) recenterG(): level hands → ${gl.angleDeg.toFixed(1)}°, hands neck-down → ${gd.angleDeg.toFixed(1)}° (floor ${UkeFrame.TILT_MIN_DEG}°, never level or neck-down)`);
+      const gs = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.0 }, tip);
+      check(Math.abs(gs.angleDeg + 40) < 1e-9, `(f) recenterG(): steep pose clamps at −40° (${gs.angleDeg.toFixed(1)}°)`);
       // neck zone covers the drawn fretboard (0.46L..L, half-width 2·spacing) with margin
       const nz = UkeFrame.neckZone();
       check(nz.x0 < 0.46 * 0.55 && nz.x1 > 0.55 && nz.yHalf > 2 * spacing, `(f) neckZone [${nz.x0.toFixed(3)}, ${nz.x1.toFixed(3)}] ±${nz.yHalf.toFixed(3)} encloses the fretboard`);

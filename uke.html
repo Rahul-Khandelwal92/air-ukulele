@@ -38,7 +38,7 @@
            border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
 
   /* ---- brand wordmark ---- */
-  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
+  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
   #brand .mark { display: flex; align-items: center; gap: 10px; }
   #brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #ffd27a, var(--accent) 60%, #d98f1f);
                  box-shadow: 0 2px 10px rgba(245,183,74,.35); position: relative; flex: none; }
@@ -49,11 +49,14 @@
   #brand .tag { font-size: 11.5px; color: var(--muted); letter-spacing: .04em; padding-left: 38px; }
 
   /* ---- HUD (top-left) ---- */
-  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 12px; width: min(360px, 34vw); min-width: 300px; }
-  #hud .card { padding: 16px 20px 18px; }
+  /* Compact: the card used to be up to 360 px wide with a 9 vw chord name and covered most of a short
+     window's height, hiding the instrument's headstock. The instrument layout also avoids this box
+     (UkeFrame.layout / V12), so any growth here costs instrument size — keep it small. */
+  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 10px; width: min(320px, 28vw); min-width: 240px; }
+  #hud .card { padding: 12px 16px 14px; }
   #hud .label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); margin-bottom: 2px; }
-  #chord { font-size: clamp(64px, 9vw, 120px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
-           padding: 4px 6px 6px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
+  #chord { font-size: clamp(44px, min(6vw, 12vh), 88px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+           padding: 2px 6px 4px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
   #chord.stale { color: var(--muted); }
   #chord.off { color: var(--accent); }
   #pos { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 1.3em; line-height: 1.3; }
@@ -175,7 +178,7 @@
     <span class="kc"><kbd>?</kbd>help</span>
     <span class="kc"><kbd>S</kbd>song</span>
     <span class="kc opt"><kbd>M</kbd>mode</span>
-    <span class="kc"><kbd>B</kbd>cap anchor</span>
+    <span class="kc opt"><kbd>A</kbd>auto-fit</span>
     <span class="kc"><kbd>K</kbd>calibrate</span>
     <span class="kc opt"><kbd>C</kbd>recentre</span>
     <span class="kc opt"><kbd>D</kbd>debug</span>
@@ -327,11 +330,24 @@ class StringVoice {
     this.delay = 100;                 // fractional delay N (samples). N = fs/f0 - 0.5
     this.rho = 0.993;                 // loop gain per period. 0.993 -> nylon uke rings ~1-2 s; 0.9 = palm mute
     this.hz = 0;
-    this.burstLeft = 0;               // remaining excitation samples
+    this.burstLeft = 0;               // remaining noise samples (one period)
+    this.excLeft = 0;                 // remaining excitation samples incl. the comb tail (N + M)
     this.burstAmp = 0;
-    this.lp = 0;                      // one-pole lowpass state for the excitation
-    // 6 kHz cutoff: a fingertip cannot excite the string much above this; removes fizz
+    this.lp = 0; this.lp2 = 0;        // two cascaded one-pole lowpass stages for the excitation (12 dB/oct)
+    // Excitation lowpass cutoff is set per pluck from velocity (see pluck): a soft pluck leaves a
+    // rounded initial displacement (few high harmonics), a hard one a sharp corner (many).
     this.lpA = 1 - Math.exp(-2 * Math.PI * 6000 / fs);
+    // Pick-position comb: the string is plucked at PICK_POS of its length, which cannot excite
+    // the harmonics with a node there (k = 5, 10, ... for 1/5). x[n] - x[n - M], M = PICK_POS * N.
+    // A uke is strummed roughly a fifth of the way from the bridge (soundhole edge).
+    this.pickPos = 0.2;
+    this.combM = 0;
+    this.exc = new Float32Array(1024); // excitation history for the comb (M <= 0.2 * N < 1024)
+    this.ew = 0;
+    // Chord-change damping: strings whose fret changes are muted by the lifting finger for a
+    // short time (a released fretted string stops within ~50-80 ms on a real uke).
+    this.dampLeft = 0;
+    this.rhoDamp = 0.9;
   }
   setFreq(hz) {
     this.hz = hz;
@@ -341,13 +357,24 @@ class StringVoice {
   }
   pluck(velocity) {
     this.burstLeft = Math.round(this.delay);   // classic KS: excitation length = one period
-    this.burstAmp = 0.6 * velocity;            // 0.6 keeps a 4-string strum under the limiter knee
-    this.lp = 0;
+    this.combM = Math.max(1, Math.round(this.pickPos * this.delay));
+    this.excLeft = this.burstLeft + this.combM;
+    // 0.6 keeps a 4-string strum under the limiter knee; 0.7 offsets the comb's +3 dB noise gain.
+    this.burstAmp = 0.6 * 0.7 * velocity;
+    // Brightness follows velocity: 1.5 kHz + 6.5 kHz * v -> 3.5 kHz at the 0.3 floor, 6.7 kHz at the
+    // 0.8 keyboard default (close to the old fixed 6 kHz), 8 kHz at 1.0.
+    const fc = 1500 + 6500 * Math.min(1, Math.max(0, velocity));
+    this.lpA = 1 - Math.exp(-2 * Math.PI * fc / this.fs);
+    this.lp = 0; this.lp2 = 0;
+    this.exc.fill(0);
+    this.dampLeft = 0;                          // a fresh pluck always rings at full rho
     // Deterministic noise per pluck (xorshift32): same pluck → same waveform, so V2 is reproducible
     // and no random burst can hand the octave to the 2nd harmonic in one run and not the next.
     this.pluckCount = (this.pluckCount || 0) + 1;
     this.rng = (0x9E3779B9 ^ (Math.round(this.delay) * 2654435761) ^ (this.pluckCount * 40503)) >>> 0 || 1;
   }
+  // Mute the ringing string for ms milliseconds (finger released or laid across the string).
+  damp(ms) { this.dampLeft = Math.round(ms * this.fs / 1000); }
   noise() {
     let x = this.rng; x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
     this.rng = x;
@@ -365,12 +392,24 @@ class StringVoice {
     const xD  = (1 - fD) * b[i0] + fD * b[i1];   // x[n-D]
     const xD1 = (1 - fD) * b[i1] + fD * b[i2];   // x[n-D-1]
     // Loop filter: rho * 0.5 * (x[n-D] + x[n-D-1]) — lowpass so high harmonics decay faster (like a real string)
-    let y = this.rho * 0.5 * (xD + xD1);
-    if (this.burstLeft > 0) {
-      const n = this.noise();
-      this.lp += this.lpA * (n - this.lp);
-      y += this.burstAmp * this.lp;
-      this.burstLeft--;
+    let rho = this.rho;
+    if (this.dampLeft > 0) { rho = this.rhoDamp; this.dampLeft--; }
+    let y = rho * 0.5 * (xD + xD1);
+    if (this.excLeft > 0) {
+      let e = 0;
+      if (this.burstLeft > 0) {
+        const n = this.noise();
+        this.lp += this.lpA * (n - this.lp);
+        this.lp2 += this.lpA * (this.lp - this.lp2);
+        e = this.lp2;
+        this.burstLeft--;
+      }
+      // comb: e[n] - e[n - M]
+      const ex = this.exc, EL = ex.length, ew = this.ew;
+      ex[ew] = e;
+      y += this.burstAmp * (e - ex[(ew - this.combM + EL) % EL]);
+      this.ew = (ew + 1) % EL;
+      this.excLeft--;
     }
     b[w] = y;
     this.w = (w + 1) % L;
@@ -414,6 +453,7 @@ class UkeProcessor extends AudioWorkletProcessor {
     this.mute = false;
     this.rho = 0.993;                 // normal ring
     this.rhoMute = 0.9;               // palm mute: dies in ~50 periods (~0.1 s)
+    this.dampMs = 80;                 // chord change: released strings damped for 80 ms (~20-35 periods at rho 0.9)
     this.strings = [0, 1, 2, 3].map(() => new StringVoice(sampleRate));
     this.queue = [];                  // pending plucks {when, string, velocity}
     // Body: ~300 Hz Helmholtz air resonance of a soprano uke body (Q3, +5 dB),
@@ -441,9 +481,14 @@ class UkeProcessor extends AudioWorkletProcessor {
                           velocity: Math.min(1, Math.max(0, +m.velocity || 0)) });
         break;
       case 'setChord':
-        if (Array.isArray(m.frets) && m.frets.length === 4) this.frets = m.frets.slice();
+        if (Array.isArray(m.frets) && m.frets.length === 4) {
+          // A finger lifting off (or landing on) a ringing string stops it; untouched strings ring on.
+          for (let i = 0; i < 4; i++) if (m.frets[i] !== this.frets[i]) this.strings[i].damp(this.dampMs);
+          this.frets = m.frets.slice();
+        }
         break;
       case 'setMute':
+        if (m.mute && !this.mute) for (const s of this.strings) s.damp(this.dampMs);   // fingers laid across all four
         this.mute = !!m.mute;
         break;
       case 'setTuning':
@@ -453,6 +498,8 @@ class UkeProcessor extends AudioWorkletProcessor {
         if (typeof m.rho === 'number') this.rho = m.rho;
         if (typeof m.rhoMute === 'number') this.rhoMute = m.rhoMute;
         if (typeof m.master === 'number') this.master = m.master;
+        if (typeof m.dampMs === 'number') this.dampMs = m.dampMs;
+        if (typeof m.pickPos === 'number') for (const s of this.strings) s.pickPos = Math.min(0.45, Math.max(0.05, m.pickPos));
         break;
     }
   }
@@ -727,6 +774,24 @@ const AudioEngine = (() => {
         m.harmonics.map(h => (h.present ? '2f 3f'.split(' ')[h.n - 2] : '--')).join(' ') +
         '  decay ' + (decayOk ? 'ok' : 'NO') + ' (' + early.toFixed(3) + '->' + late.toFixed(3) + ')'
       );
+    }
+    // Brightness: a hard pluck must carry more energy above 2 kHz (relative to below) than a soft one.
+    {
+      const hfRatio = (x) => {
+        const seg = x.subarray(Math.round(0.02 * sr), Math.round(0.27 * sr));
+        const npad = 16384, re = new Float32Array(npad), im = new Float32Array(npad);
+        for (let i = 0; i < seg.length && i < npad; i++) re[i] = seg[i];
+        fft(re, im);
+        let lo = 0, hi = 0;
+        const kSplit = Math.round(2000 / (sr / npad));
+        for (let k = 1; k < npad / 2; k++) { const m2 = re[k] * re[k] + im[k] * im[k]; if (k < kSplit) lo += m2; else hi += m2; }
+        return hi / Math.max(1e-20, lo);
+      };
+      const soft = hfRatio(await renderOne(Tuning.CHORDS.open, 3, 0.3, sr, 0.3));
+      const hard = hfRatio(await renderOne(Tuning.CHORDS.open, 3, 1.0, sr, 0.3));
+      const ok = hard > soft * 1.5;
+      if (!ok) pass = false;
+      lines.push((ok ? 'PASS' : 'FAIL') + ' brightness: HF/LF energy A4 soft(v=0.3) ' + soft.toExponential(2) + '  hard(v=1.0) ' + hard.toExponential(2) + '  (hard > 1.5x soft)');
     }
     lines.unshift(pass ? 'V2 PITCH OK' : 'V2 PITCH FAILED');
     return { pass, lines };
@@ -1046,8 +1111,12 @@ const Chord = (() => {
     // knuckle) or closer. curl maps that ratio linearly onto [0,1].
     extRatio: 1.8,
     curlRatio: 1.0,
-    // a finger counts as DOWN (fretting) above this curl
+    // a finger counts as DOWN (fretting) above this curl (centre of the band)
     downThreshold: 0.35,
+    // Hysteresis half-width: a finger flips to DOWN only above thr+hyst (0.40) and back
+    // to UP only below thr-hyst (0.30). Inside the band it keeps its previous state, so a
+    // fingertip hovering at the threshold cannot flicker the chord frame to frame.
+    hysteresis: 0.05,
     // per-dimension std floor for the calibrated classifier (normalised units)
     stdFloor: 0.02,
   };
@@ -1106,16 +1175,30 @@ const Chord = (() => {
     { down: [1, 1, 1, 1], chord: 'mute' },
   ];
 
-  function classifyRules(c) {
-    const thr = params.downThreshold;
-    const down = FINGER_NAMES.map(f => (c[f] > thr ? 1 : 0));
+  // prevDown: previous frame's down flags [index,middle,ring,pinky] (0/1) or null.
+  // With no history the centre threshold decides; with history the band applies.
+  function fingerDown(curl, prev) {
+    const thr = params.downThreshold, h = params.hysteresis;
+    if (prev == null) return curl > thr ? 1 : 0;
+    if (curl > thr + h) return 1;
+    if (curl < thr - h) return 0;
+    return prev ? 1 : 0;
+  }
+  function classifyRules(c, prevDown = null) {
+    const thr = params.downThreshold, h = params.hysteresis;
+    const down = FINGER_NAMES.map((f, i) => fingerDown(c[f], prevDown ? prevDown[i] : null));
+    // confidence = how far the least certain finger sits outside the hysteresis band,
+    // mapped so a finger at curl 0 or 0.7+ reads 1 and a finger inside the band reads 0.
     let conf = 1;
-    for (const f of FINGER_NAMES) conf = Math.min(conf, Math.abs(c[f] - thr) / thr);
+    for (const f of FINGER_NAMES) {
+      const d = Math.max(0, Math.abs(c[f] - thr) - h);
+      conf = Math.min(conf, d / (thr - h));
+    }
     conf = clamp01(conf);
     for (const r of RULES) {
-      if (r.down.every((d, i) => d === down[i])) return { chord: r.chord, confidence: conf };
+      if (r.down.every((d, i) => d === down[i])) return { chord: r.chord, confidence: conf, down };
     }
-    return { chord: null, confidence: 0 };
+    return { chord: null, confidence: 0, down };
   }
 
   // ---- calibration store ----------------------------------------------------
@@ -1225,14 +1308,15 @@ const Chord = (() => {
     return nearest(normalize(lm), store.models());
   }
 
-  function classify(lm, store = calib) {
+  // prevDown: the `down` array returned by the previous call (rules hysteresis); pass null to reset.
+  function classify(lm, store = calib, prevDown = null) {
     const c = curls(lm);
     if (store.has()) {
       const r = classifyCalibrated(lm, store);
-      return { chord: r.chord, confidence: r.confidence, curls: c, method: 'calib' };
+      return { chord: r.chord, confidence: r.confidence, curls: c, method: 'calib', down: null };
     }
-    const r = classifyRules(c);
-    return { chord: r.chord, confidence: r.confidence, curls: c, method: 'rules' };
+    const r = classifyRules(c, prevDown);
+    return { chord: r.chord, confidence: r.confidence, curls: c, method: 'rules', down: r.down };
   }
 
   // ---- temporal voter -------------------------------------------------------
@@ -1344,6 +1428,27 @@ const Chord = (() => {
       lines.push(`${ok ? 'PASS' : 'FAIL'} invariance mirror+40°: max curl Δ ${curlErr.toFixed(3)}, max frame Δ ${frameErr.toFixed(3)}`);
     }
 
+    // (a'') hysteresis: a ring curl inside the band keeps its previous state, outside it flips
+    {
+      const thr = params.downThreshold, h = params.hysteresis;
+      const mk = ring => ({ index: 0.05, middle: 0.05, ring, pinky: 0.05 });
+      const UP = [0, 0, 0, 0], DOWN = [0, 0, 1, 0];
+      const cases = [
+        [mk(thr + h * 0.6), UP,   'open', 'in band, was up   → stays open'],
+        [mk(thr + h * 0.6), DOWN, 'C',    'in band, was down → stays C'],
+        [mk(thr - h * 0.6), DOWN, 'C',    'in band, was down → stays C'],
+        [mk(thr + h * 1.4), UP,   'C',    'above band        → flips to C'],
+        [mk(thr - h * 1.4), DOWN, 'open', 'below band        → flips to open'],
+        [mk(thr + h * 0.6), null, 'C',    'no history        → centre threshold'],
+      ];
+      for (const [c, prev, want, label] of cases) {
+        const res = classifyRules(c, prev);
+        const ok = res.chord === want;
+        if (!ok) pass = false;
+        lines.push(`${ok ? 'PASS' : 'FAIL'} hysteresis ring=${c.ring.toFixed(2)} ${label} (got ${res.chord})`);
+      }
+    }
+
     // (b) calibration: stored store, or a synthetic one on request
     let store = calib.has() ? calib : null;
     if (!store && opts.syntheticCalib) {
@@ -1381,7 +1486,7 @@ const Chord = (() => {
 
   return {
     params, FINGER_NAMES, LABEL_DOWN,
-    normalize, curls, classifyRules, classifyCalibrated, classify,
+    normalize, curls, fingerDown, classifyRules, classifyCalibrated, classify,
     calib, createCalib, createVoter,
     syntheticHand, rotateHand, mirrorHand, selfTest,
   };
@@ -1444,11 +1549,84 @@ const UkeFrame = (() => {
     const dy = p.y - state.bridge.y;
     return { x: dx * u.x + dy * u.y, y: dx * v.x + dy * v.y };
   }
-  function toScreen(l) {
-    const { u, v } = axes();
+  // Same transform for an arbitrary geometry object (used by layout() before committing to state).
+  function toScreenG(g, l) {
+    const a = (g.angleDeg * Math.PI) / 180;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
     const ix = l.x * u.x + l.y * v.x;
     const iy = l.x * u.y + l.y * v.y;
-    return { x: state.bridge.x + ix / state.aspect, y: state.bridge.y + iy };
+    return { x: g.bridge.x + ix / g.aspect, y: g.bridge.y + iy };
+  }
+  function toScreen(l) { return toScreenG(state, l); }
+
+  // ---- layout: keep the whole instrument clear of the HUD and panels ---------------------------
+  // Local-space box enclosing everything drawn for the instrument INCLUDING the annotation layer:
+  // body tail −0.16L … headstock end 1.17L along the neck; body ±3.15·s, fret numbers to +2.8·s and
+  // the hand-glyph plate above the neck to about −7.5·s across it. Multiples of L (x) and spacing (y).
+  const EXTENT = { x0: -0.18, x1: 1.19, y0: -7.6, y1: 3.6 };
+  function boundsOf(g = state) {
+    const pts = [[EXTENT.x0, EXTENT.y0], [EXTENT.x1, EXTENT.y0], [EXTENT.x0, EXTENT.y1], [EXTENT.x1, EXTENT.y1]]
+      .map(([kx, ky]) => toScreenG(g, { x: kx * g.length, y: ky * g.spacing }));
+    return { x0: Math.min(...pts.map(p => p.x)), y0: Math.min(...pts.map(p => p.y)),
+             x1: Math.max(...pts.map(p => p.x)), y1: Math.max(...pts.map(p => p.y)) };
+  }
+  const intersects = (a, b) => a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+  const insideViewport = b => b.x0 >= 0 && b.y0 >= 0 && b.x1 <= 1 && b.y1 <= 1;
+
+  // Default placement: body right of centre at chest height, neck rising up-left at −18°.
+  const LAYOUT_DEFAULT = { bridge: { x: 0.64, y: 0.62 }, angleDeg: -18 };
+  // Search space when the default collides: bridge grid (normalised), neck angles from the default
+  // down to level (a flatter neck is narrower), scale steps down to 0.6 (below that the fret spaces
+  // are smaller than a fingertip and position play stops working). Tilt is worth more than size: a
+  // tilted neck is how a ukulele is held, so the requested angle is kept down to scale 0.76 before
+  // the neck is flattened (20 Sept: the level, full-size neck in the user's screenshot read as wrong).
+  const LAYOUT_BX = [0.50, 0.90, 0.02], LAYOUT_BY = [0.40, 0.86, 0.02];
+  const LAYOUT_ANGLES = a => [a, a / 2, 0];
+  const LAYOUT_SCALES = [1, 0.92, 0.84, 0.76, 0.68, 0.6];
+  const LAYOUT_MIN_SCALE_TILTED = 0.76;
+  // The strum zone must stay in the right half: roles are assigned by screen side, so a strumming
+  // hand working left of the midline would be taken for the fretting hand.
+  const zoneMidX = g => toScreenG(g, { x: 0.25 * g.length, y: 0 }).x;
+  const overlapArea = (a, b) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+
+  // Pure. Given the canvas aspect, the unscaled base size and obstacle rects (normalised screen
+  // coords, e.g. the HUD card, the status bar, open side panels), return a geometry whose bounds
+  // sit inside the viewport and touch no obstacle, with the strum zone in the right half. Prefers
+  // the default; otherwise the nearest bridge position at the largest scale (then the steepest
+  // angle) that fits. If nothing fits, the least-overlapping smallest placement with `ok:false`.
+  function layout({ aspect = 1, base, avoid = [], defaults = LAYOUT_DEFAULT } = {}) {
+    const mk = (bx, by, k, ang) => ({ aspect, bridge: { x: bx, y: by }, angleDeg: ang, length: base.length * k, spacing: base.spacing * k });
+    const clear = g => { const b = boundsOf(g); return insideViewport(b) && !avoid.some(r => intersects(b, r)); };
+    const fits = g => zoneMidX(g) >= 0.5 && clear(g);
+    const g0 = mk(defaults.bridge.x, defaults.bridge.y, 1, defaults.angleDeg);
+    if (fits(g0)) return { ...g0, ok: true, scale: 1, moved: false };
+    const cands = [];
+    for (let by = LAYOUT_BY[0]; by <= LAYOUT_BY[1] + 1e-9; by += LAYOUT_BY[2]) {
+      for (let bx = LAYOUT_BX[0]; bx <= LAYOUT_BX[1] + 1e-9; bx += LAYOUT_BX[2]) {
+        cands.push({ bx, by, d: Math.hypot((bx - defaults.bridge.x) * aspect, by - defaults.bridge.y) });
+      }
+    }
+    cands.sort((a, b) => a.d - b.d);
+    for (const ang of LAYOUT_ANGLES(defaults.angleDeg)) {
+      for (const k of LAYOUT_SCALES) {
+        if (ang !== 0 && k < LAYOUT_MIN_SCALE_TILTED) break;
+        for (const c of cands) { const g = mk(c.bx, c.by, k, ang); if (fits(g)) return { ...g, ok: true, scale: k, moved: true }; }
+      }
+    }
+    // Nothing fits: take the smallest instrument with the least UI overlap (still right-half, still inside).
+    let best = null, bestCost = Infinity;
+    const kMin = LAYOUT_SCALES[LAYOUT_SCALES.length - 1];
+    for (const ang of LAYOUT_ANGLES(defaults.angleDeg)) {
+      for (const c of cands) {
+        const g = mk(c.bx, c.by, kMin, ang);
+        if (zoneMidX(g) < 0.5) continue;
+        const b = boundsOf(g);
+        if (!insideViewport(b)) continue;
+        const cost = avoid.reduce((s, r) => s + overlapArea(b, r), 0);
+        if (cost < bestCost) { bestCost = cost; best = g; }
+      }
+    }
+    return { ...(best || g0), ok: false, scale: best ? kMin : 1, moved: !!best };
   }
 
   function stringLocalYs() {
@@ -1477,26 +1655,46 @@ const UkeFrame = (() => {
   // top string (on the "armed" side of the string band): a resting hand recentred with C
   // must not be parked on a string line, or jitter would pluck it.
   const RECENTER_TIP_Y = spacing => -(1.5 + 2.5) * spacing;
-  function recenter(frettingWrist, strummingTip) {
-    if (!frettingWrist || !strummingTip) return get();
-    const ax = (frettingWrist.x - strummingTip.x) * state.aspect;
-    const ay = frettingWrist.y - strummingTip.y;
+  // A ukulele is held with the neck rising toward the fretting hand: 12°–40° above level (players sit
+  // around 15°–25°). Level or neck-down never happens on a real instrument, so the tilt is clamped to
+  // this range even when the hands are level: the nut then sits ≤ 0.1 frame heights above the fretting
+  // knuckles, well within the reach of the fingers, and the coaching arrows guide the hand up.
+  const TILT_MIN_DEG = -12, TILT_MAX_DEG = -40;
+  // Pure: the recentred geometry for an arbitrary geometry g (its length/spacing/aspect are kept).
+  // `frettingAim` is where the neck should pass: the fretting hand's knuckles (middle MCP, landmark 9)
+  // in live use, so the fingers curl down onto the strings like on a real neck.
+  function recenterG(g, frettingAim, strummingTip) {
+    const out = { aspect: g.aspect, bridge: { ...g.bridge }, angleDeg: g.angleDeg, length: g.length, spacing: g.spacing };
+    if (!frettingAim || !strummingTip) return out;
+    const ax = (frettingAim.x - strummingTip.x) * g.aspect;
+    const ay = frettingAim.y - strummingTip.y;
     const n = Math.hypot(ax, ay);
-    if (n < 1e-6) return get();
+    if (n < 1e-6) return out;
     const ux = ax / n, uy = ay / n;
-    // u = (−cos a, sin a)  ⇒  a = atan2(uy, −ux); clamp to a sane playing tilt
+    // u = (−cos a, sin a)  ⇒  a = atan2(uy, −ux); negative = headstock rises up-left
     let a = Math.atan2(uy, -ux);
-    const lim = (40 * Math.PI) / 180;
-    a = Math.max(-lim, Math.min(lim, a));
-    state.angleDeg = (a * 180) / Math.PI;
-    const { u, v } = axes();
-    const d = 0.25 * state.length, ty = RECENTER_TIP_Y(state.spacing);
+    a = Math.min((TILT_MIN_DEG * Math.PI) / 180, Math.max((TILT_MAX_DEG * Math.PI) / 180, a));
+    out.angleDeg = (a * 180) / Math.PI;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
+    const d = 0.25 * g.length, ty = RECENTER_TIP_Y(g.spacing);
     // tip_local = (d, ty)  ⇒  bridge = tip − (d·u + ty·v) in iso coords
-    state.bridge = {
-      x: strummingTip.x - (d * u.x + ty * v.x) / state.aspect,
+    out.bridge = {
+      x: strummingTip.x - (d * u.x + ty * v.x) / g.aspect,
       y: strummingTip.y - (d * u.y + ty * v.y),
     };
+    return out;
+  }
+  function recenter(frettingWrist, strummingTip) {
+    const g = recenterG(state, frettingWrist, strummingTip);
+    state.angleDeg = g.angleDeg; state.bridge = g.bridge;
     return get();
+  }
+  // Pure inverse of toScreenG for an arbitrary geometry.
+  function toLocalG(g, p) {
+    const a = (g.angleDeg * Math.PI) / 180;
+    const u = { x: -Math.cos(a), y: Math.sin(a) }, v = { x: Math.sin(a), y: Math.cos(a) };
+    const dx = (p.x - g.bridge.x) * g.aspect, dy = p.y - g.bridge.y;
+    return { x: dx * u.x + dy * u.y, y: dx * v.x + dy * v.y };
   }
 
   // Appearance only — geometry lives above. Tweak freely.
@@ -1701,8 +1899,62 @@ const UkeFrame = (() => {
     ctx.restore();
   }
 
-  return { set, get, toLocal, toScreen, stringLocalYs, stringScreenSegments,
-           strumZone, neckZone, recenter, RECENTER_TIP_Y, draw, theme };
+  // -------------------------------------------------------------- V12 self-test (layout)
+  // The instrument must never sit under the HUD, the status bar or an open side panel, on any
+  // plausible window. Obstacles are modelled in CSS pixels like the real DOM: HUD card top-left
+  // (24 px inset, width min(320 px, 28 vw), up to 480 px tall), status bar 40 px along the bottom,
+  // and optionally a 300 px right-hand panel (help / song).
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push(`${ok ? 'PASS' : 'FAIL'} ${msg}`); };
+    const viewports = [[1920, 1080], [1665, 663], [1536, 864], [1366, 768], [1280, 720], [1024, 640], [2560, 1080], [1280, 1024]];
+    const baseFor = aspect => ({ length: Math.min(0.66, 0.38 * aspect), spacing: 0.05 });
+    const px = (W, H, x, y, w, h, pad = 12) => ({ x0: (x - pad) / W, y0: (y - pad) / H, x1: (x + w + pad) / W, y1: (y + h + pad) / H });
+    const fmt = b => `[${b.x0.toFixed(2)},${b.y0.toFixed(2)}]–[${b.x1.toFixed(2)},${b.y1.toFixed(2)}]`;
+    for (const [W, H] of viewports) {
+      const aspect = W / H, base = baseFor(aspect);
+      const hudW = Math.min(320, 0.28 * W), hudH = Math.min(480, 0.8 * H - 24);
+      const hud = px(W, H, 24, 24, hudW, hudH), status = px(W, H, 0, H - 40, W, 40);
+      for (const panel of [null, px(W, H, W - 324, 24, 300, H - 120)]) {
+        const avoid = [hud, status].concat(panel ? [panel] : []);
+        const g = layout({ aspect, base, avoid });
+        const b = boundsOf(g);
+        const hit = avoid.filter(r => intersects(b, r)).length;
+        const zoneMid = toScreenG(g, { x: 0.25 * g.length, y: 0 });
+        check(g.ok && hit === 0 && insideViewport(b),
+          `${W}×${H}${panel ? ' +panel' : ''}: instrument ${fmt(b)} clear of ${avoid.length} obstacles, scale ${g.scale}${g.moved ? ` bridge (${g.bridge.x.toFixed(2)},${g.bridge.y.toFixed(2)})` : ' default'}`);
+        check(zoneMid.x > 0.5, `${W}×${H}${panel ? ' +panel' : ''}: strum zone stays in the right half (x ${zoneMid.x.toFixed(2)})`);
+      }
+    }
+    // a collision must cost size before it costs tilt: a 300 px panel on 1920×1080 → still −18°, smaller
+    {
+      const W = 1920, H = 1080, aspect = W / H;
+      const hud = px(W, H, 24, 24, Math.min(320, 0.28 * W), Math.min(480, 0.8 * H - 24)), status = px(W, H, 0, H - 40, W, 40), panel = px(W, H, W - 324, 24, 300, H - 120);
+      const g = layout({ aspect, base: baseFor(aspect), avoid: [hud, status, panel] });
+      check(g.ok && g.angleDeg === LAYOUT_DEFAULT.angleDeg, `cramped 1920×1080 +panel keeps the ${LAYOUT_DEFAULT.angleDeg}° tilt (got ${g.angleDeg}°, scale ${g.scale})`);
+    }
+    // no obstacles → default geometry untouched
+    const free = layout({ aspect: 16 / 9, base: baseFor(16 / 9), avoid: [] });
+    check(free.ok && !free.moved && free.scale === 1 && free.bridge.x === LAYOUT_DEFAULT.bridge.x && free.bridge.y === LAYOUT_DEFAULT.bridge.y, 'no obstacles → default placement');
+    // an obstacle covering the whole screen → reported, not silently accepted
+    const blocked = layout({ aspect: 16 / 9, base: baseFor(16 / 9), avoid: [{ x0: 0, y0: 0, x1: 1, y1: 1 }] });
+    check(!blocked.ok, 'impossible layout is reported as ok:false');
+    // bounds really enclose the drawn extents: strings, headstock end, body tail, glyph
+    {
+      const g = { aspect: 16 / 9, bridge: { x: 0.64, y: 0.62 }, angleDeg: -18, length: 0.66, spacing: 0.05 };
+      const b = boundsOf(g);
+      const probes = [{ x: 0, y: -0.075 }, { x: 0.66, y: 0.075 }, { x: -0.16 * 0.66, y: 0 }, { x: 1.17 * 0.66, y: 0 }, { x: 0.78 * 0.66, y: -7.2 * 0.05 }, { x: 0.5 * 0.66, y: 3.15 * 0.05 }];
+      const inside = probes.every(l => { const p = toScreenG(g, l); return p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1; });
+      check(inside, 'boundsOf() encloses bridge, nut, tail, headstock, glyph and body probes');
+    }
+    lines.unshift(pass ? 'V12 LAYOUT OK' : 'V12 LAYOUT FAILED');
+    return { pass, lines };
+  }
+
+  return { set, get, toLocal, toLocalG, toScreen, toScreenG, stringLocalYs, stringScreenSegments,
+           strumZone, neckZone, recenter, recenterG, RECENTER_TIP_Y, TILT_MIN_DEG, TILT_MAX_DEG, draw, theme,
+           boundsOf, intersects, layout, LAYOUT_DEFAULT, EXTENT, selfTest };
 })();
 
 // ============================================================================
@@ -1978,7 +2230,7 @@ const Strum = (() => {
       }
       check(err2 < 1e-9, `(f) round trip with aspect 16:9 max error ${err2.toExponential(2)}`);
       // recenter puts the tip inside the strum zone, above the top string on the armed side
-      const tip = { x: 0.7, y: 0.6 }, wrist = { x: 0.3, y: 0.5 };
+      const tip = { x: 0.7, y: 0.6 }, wrist = { x: 0.3, y: 0.40 };   // fretting knuckles up-left of the tip: −15.7° neck, inside the clamp
       UkeFrame.recenter(wrist, tip);
       const lt = UkeFrame.toLocal(tip);
       const [z0, z1] = UkeFrame.strumZone();
@@ -1986,7 +2238,12 @@ const Strum = (() => {
       check(Math.abs(lt.y - wantY) < 1e-9 && lt.y < topY - 0.3 * spacing && lt.x > z0 && lt.x < z1,
         `(f) recenter(): tip at local (${lt.x.toFixed(3)}, ${lt.y.toFixed(3)}) inside zone [${z0.toFixed(3)}, ${z1.toFixed(3)}], clear of the top string (${topY.toFixed(3)})`);
       const lw = UkeFrame.toLocal(wrist);
-      check(Math.abs(lw.y - wantY) < 1e-6 && lw.x > lt.x, `(f) recenter(): neck aims at wrist (wrist local y ${lw.y.toFixed(3)} = tip y)`);
+      check(Math.abs(lw.y - wantY) < 1e-6 && lw.x > lt.x, `(f) recenter(): neck aims at the fretting knuckles (local y ${lw.y.toFixed(3)} = tip y, angle ${UkeFrame.get().angleDeg.toFixed(1)}°)`);
+      // level hands still give a tilted neck; a neck-down pose is clamped to the same floor
+      const gl = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.6 }, tip), gd = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.8 }, tip);
+      check(Math.abs(gl.angleDeg - UkeFrame.TILT_MIN_DEG) < 1e-9 && Math.abs(gd.angleDeg - UkeFrame.TILT_MIN_DEG) < 1e-9, `(f) recenterG(): level hands → ${gl.angleDeg.toFixed(1)}°, hands neck-down → ${gd.angleDeg.toFixed(1)}° (floor ${UkeFrame.TILT_MIN_DEG}°, never level or neck-down)`);
+      const gs = UkeFrame.recenterG(UkeFrame.get(), { x: 0.3, y: 0.0 }, tip);
+      check(Math.abs(gs.angleDeg + 40) < 1e-9, `(f) recenterG(): steep pose clamps at −40° (${gs.angleDeg.toFixed(1)}°)`);
       // neck zone covers the drawn fretboard (0.46L..L, half-width 2·spacing) with margin
       const nz = UkeFrame.neckZone();
       check(nz.x0 < 0.46 * 0.55 && nz.x1 > 0.55 && nz.yHalf > 2 * spacing, `(f) neckZone [${nz.x0.toFixed(3)}, ${nz.x1.toFixed(3)}] ±${nz.yHalf.toFixed(3)} encloses the fretboard`);
@@ -2379,7 +2636,7 @@ const Annot = (() => {
         container.appendChild(row);
       });
       const foot = document.createElement('div'); foot.className = 'hfoot';
-      foot.textContent = 'Right hand: sweep the index finger across the strings · B: click the blue cap to anchor · S: song · ?: hide';
+      foot.textContent = 'Right hand: sweep the index finger across the strings · hold both hands still 2 s to fit the uke to you (C recentres) · S: song · ?: hide';
       container.appendChild(foot);
       container.dataset.annotBuilt = '1';
     }
@@ -2500,307 +2757,259 @@ const Annot = (() => {
 
 
 // ==========================================================================
-// SECTION anchor/  (src/anchor.js)
+// SECTION fit/  (src/fit.js)
 // ==========================================================================
 // ============================================================================
-// anchor/  — blue-pen-cap body anchor. The instrument follows the cap on the
-// player's T-shirt: position AND size. The user clicks the cap once to sample
-// its colour. Detection maths are pure functions over an ImageData-like
-// {data, width, height} so they run in node; only sampleFrame touches the DOM.
+// fit/ — size and place the instrument from the player's own hands, hands-free
+// ----------------------------------------------------------------------------
+// The frame stays FIXED while you play: strum detection needs a still frame,
+// and a frame that followed a hand could never be strummed. It moves only in
+// discrete, animated refits, when both hands have been still for a while with
+// the strumming tip clear of the strings (the natural "I'm ready" pose), and
+// then only if the change is worth making. Size comes from the palms, so the
+// instrument shrinks when you step back and grows when you lean in.
+// Pure functions. Depends on the global `UkeFrame` (src/strum.js) for the
+// recentre geometry; no DOM, no camera.
 // ============================================================================
-const Anchor = (() => {
+const Fit = (() => {
   const params = {
-    hueTol: 18,        // degrees of circular hue distance accepted around the target; blue ink varies ±15° under mixed lighting
-    satMin: 0.35,      // below this a pixel is grey/white (T-shirt, wall), never the cap
-    valMin: 0.2,       // below this it is shadow; hue is unreliable in the dark
-    minAreaFrac: 0.0004, // 160×90 → 5.8 px: rejects specks and blue sensor noise
-    maxAreaFrac: 0.02,   // 160×90 → 288 px: rejects jeans, blue walls, blue shirts
-    smooth: 0.15,      // EMA alpha per update; ~6 frames to settle, kills jitter without visible lag
-    lostMs: 1000,      // after this long unseen the integrator freezes the instrument in place
-    scanW: 160,        // scan resolution; 160×90 keeps mask+blobs well under 3 ms
-    scanH: 90,
+    // Size comes from the distance between the hands in the ready pose: on a real ukulele the
+    // fretting knuckles sit just past the nut (≈ 1.10 L from the bridge) and the strumming finger
+    // over the lower body (0.25 L), so the hands span ≈ 0.85 scale lengths. The palm was tried first
+    // (3.5 palms) but hands are nearer the camera than the body and read 1.5–2× too big.
+    spanPerLength: 0.85,
+    // String spacing as a fraction of scale length. A real uke is 10.5 mm / 350 mm = 0.03; on screen
+    // the cells must stay fingertip-sized for position play, so we keep the drawn ratio 0.05 / 0.66.
+    spacingRatio: 0.05 / 0.66,
+    // Size bounds relative to the layout base (0.66 frame heights ≈ a soprano at chest height):
+    // below 0.6 the fret spaces are smaller than a fingertip (see UkeFrame.layout); the base itself
+    // is the ceiling — bigger looked zoomed-in on the user's screen.
+    minScale: 0.6, maxScale: 1.0,
+    // Plausible hand spans in frame heights; outside this one "hand" is a face or a blur.
+    spanMin: 0.15, spanMax: 1.5,
+    stillMs: 1500,          // both wrists still this long → the player is posed and waiting
+    stillTol: 0.015,        // wrist wander allowed while "still": 1.5 % of the frame height
+    minIntervalMs: 3000,    // never refit more often than this
+    deadBridge: 0.02,       // skip a refit that moves the bridge less than 2 % of the frame height…
+    deadScale: 0.05,        // …or changes size by less than 5 %…
+    deadAngleDeg: 3,        // …or tilts by less than 3°
+    animMs: 300,            // glide time from the old frame to the new one
   };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const isoDist = (a, b, aspect) => Math.hypot((a.x - b.x) * aspect, a.y - b.y);
 
-  const STORE_KEY = 'uke.anchor.v1';
-  const DEFAULT_TARGET = { h: 220, s: 0.7, v: 0.6 };   // generic blue pen cap before the user samples
-  let target = { ...DEFAULT_TARGET };
+  // Wrist (0) → middle MCP (9) in iso units (kept for the debug HUD).
+  function palmLength(landmarks, aspect = 1) { return isoDist(landmarks[0], landmarks[9], aspect); }
+  // Fretting knuckles (9) → strumming index tip (8) in iso units: how far apart the player holds the hands.
+  function handSpan(fretting, strumming, aspect = 1) { return isoDist(fretting[9], strumming[8], aspect); }
 
-  // R_REF: a pen cap seen at arm's length on a 640×480 webcam is ~12 px tall in a 480 px frame
-  // ≈ 2.5% of frame height. r/R_REF = 1 means "the size we designed the default instrument for".
-  const R_REF = 0.025;
-
-  // -------------------------------------------------------------- colour
-  function rgbToHsv(r, g, b) {
-    r /= 255; g /= 255; b /= 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
-    let h = 0;
-    if (d > 0) {
-      if (max === r) h = 60 * (((g - b) / d) % 6);
-      else if (max === g) h = 60 * ((b - r) / d + 2);
-      else h = 60 * ((r - g) / d + 4);
-      if (h < 0) h += 360;
-    }
-    return { h, s: max > 0 ? d / max : 0, v: max };
-  }
-  function hueDiff(a, b) {
-    const d = Math.abs(a - b) % 360;
-    return d > 180 ? 360 - d : d;
+  // Instrument size for a hand span: { length, spacing, scale } with scale relative to `base`.
+  function sizeForSpan(span, base) {
+    const scale = clamp((span / params.spanPerLength) / base.length, params.minScale, params.maxScale);
+    const length = base.length * scale;
+    return { length, spacing: length * params.spacingRatio, scale };
   }
 
-  // -------------------------------------------------------------- target colour
-  function setTarget(t) { target = { h: +t.h, s: +t.s, v: +t.v }; }
-  function getTarget() { return { ...target }; }
-  function save() {
-    if (typeof localStorage === 'undefined') return false;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(target)); return true; } catch (e) { return false; }
-  }
-  function load() {
-    if (typeof localStorage === 'undefined') return false;
-    try {
-      const s = localStorage.getItem(STORE_KEY);
-      if (!s) return false;
-      const t = JSON.parse(s);
-      if (typeof t.h === 'number' && typeof t.s === 'number' && typeof t.v === 'number') { setTarget(t); return true; }
-    } catch (e) { }
-    return false;
-  }
-  // Average HSV of a (2r+1)² patch. (nx, ny) are MIRRORED normalized screen coords, so un-mirror x.
-  function sampleColorAt(img, nx, ny, radius) {
-    radius = radius == null ? 2 : radius;
-    const W = img.width, H = img.height, d = img.data;
-    const px = Math.round((1 - nx) * (W - 1)), py = Math.round(ny * (H - 1));
-    let r = 0, g = 0, b = 0, n = 0;
-    for (let y = Math.max(0, py - radius); y <= Math.min(H - 1, py + radius); y++)
-      for (let x = Math.max(0, px - radius); x <= Math.min(W - 1, px + radius); x++) {
-        const i = 4 * (y * W + x);
-        r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
-      }
-    if (!n) return null;
-    return rgbToHsv(r / n, g / n, b / n);
-  }
-
-  // -------------------------------------------------------------- frame capture (DOM only here)
-  let scanCanvas = null, scanCtx = null;
-  function sampleFrame(videoEl, scanW, scanH) {
-    scanW = scanW || params.scanW; scanH = scanH || params.scanH;
-    if (!videoEl || videoEl.readyState < 2) return null;
-    if (!scanCanvas || scanCanvas.width !== scanW || scanCanvas.height !== scanH) {
-      scanCanvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(scanW, scanH) : document.createElement('canvas');
-      scanCanvas.width = scanW; scanCanvas.height = scanH;
-      scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
-    }
-    scanCtx.drawImage(videoEl, 0, 0, scanW, scanH);   // not mirrored; coordinates are mirrored later
-    return scanCtx.getImageData(0, 0, scanW, scanH);
-  }
-
-  // -------------------------------------------------------------- mask + blobs (pure)
-  function mask(img, tgt, p) {
-    tgt = tgt || target; p = p || params;
-    const W = img.width, H = img.height, d = img.data;
-    const out = new Uint8Array(W * H);
-    for (let i = 0, j = 0; i < W * H; i++, j += 4) {
-      const c = rgbToHsv(d[j], d[j + 1], d[j + 2]);
-      if (c.s >= p.satMin && c.v >= p.valMin && hueDiff(c.h, tgt.h) <= p.hueTol) out[i] = 1;
-    }
-    return out;
-  }
-
-  // Connected components, 4-neighbour, iterative flood fill with an explicit stack (no recursion).
-  function blobs(m, W, H, p) {
-    p = p || params;
-    const minA = p.minAreaFrac * W * H, maxA = p.maxAreaFrac * W * H;
-    const seen = new Uint8Array(W * H);
-    const stack = new Int32Array(W * H);
-    const out = [];
-    for (let s = 0; s < W * H; s++) {
-      if (!m[s] || seen[s]) continue;
-      let sp = 0, area = 0, sx = 0, sy = 0;
-      stack[sp++] = s; seen[s] = 1;
-      while (sp > 0) {
-        const i = stack[--sp];
-        const x = i % W, y = (i - x) / W;
-        area++; sx += x; sy += y;
-        if (x > 0     && m[i - 1] && !seen[i - 1]) { seen[i - 1] = 1; stack[sp++] = i - 1; }
-        if (x < W - 1 && m[i + 1] && !seen[i + 1]) { seen[i + 1] = 1; stack[sp++] = i + 1; }
-        if (y > 0     && m[i - W] && !seen[i - W]) { seen[i - W] = 1; stack[sp++] = i - W; }
-        if (y < H - 1 && m[i + W] && !seen[i + W]) { seen[i + W] = 1; stack[sp++] = i + W; }
-      }
-      if (area < minA || area > maxA) continue;
-      out.push({ cx: sx / area, cy: sy / area, area, r: Math.sqrt(area / Math.PI) });
-    }
-    out.sort((a, b) => b.area - a.area);
-    return out;
-  }
-
-  // prev = {cx, cy} in pixels. Prefer the blob nearest to prev within 25% of the width; else the largest.
-  function pick(list, prev, W) {
-    if (!list.length) return null;
-    if (prev && W) {
-      let best = null, bd = 0.25 * W;
-      for (const b of list) {
-        const d = Math.hypot(b.cx - prev.cx, b.cy - prev.cy);
-        if (d <= bd) { bd = d; best = b; }
-      }
-      if (best) return best;
-    }
-    return list[0];
-  }
-
-  // -------------------------------------------------------------- tracker
-  function createTracker(p) {
-    p = Object.assign({}, params, p || {});
-    let last = null;            // {x, y, r} smoothed, mirrored normalized
-    let prevPx = null;          // {cx, cy} pixels, unmirrored, for nearest-to-prev
-    let lastSeenMs = null;
-    function update(img, nowMs) {
-      const W = img.width, H = img.height;
-      const b = pick(blobs(mask(img, target, p), W, H, p), prevPx, W);
-      if (b) {
-        prevPx = { cx: b.cx, cy: b.cy };
-        const x = 1 - b.cx / W, y = b.cy / H, r = b.r / H;   // mirrored to match the displayed video
-        if (!last) last = { x, y, r };
-        else { const a = p.smooth; last = { x: last.x + a * (x - last.x), y: last.y + a * (y - last.y), r: last.r + a * (r - last.r) }; }
-        lastSeenMs = nowMs;
-        return { x: last.x, y: last.y, r: last.r, visible: true, lostForMs: 0 };
-      }
-      const lost = lastSeenMs == null ? Infinity : nowMs - lastSeenMs;
-      if (last) return { x: last.x, y: last.y, r: last.r, visible: false, lostForMs: lost };
-      return { x: NaN, y: NaN, r: NaN, visible: false, lostForMs: lost };
-    }
-    function reset() { last = null; prevPx = null; lastSeenMs = null; }
-    return { update, reset, last: () => (last ? { ...last } : null) };
-  }
-
-  // -------------------------------------------------------------- geometry (pure)
-  // The cap sits on the chest. In the mirrored view the strumming hand is on the right, so the
-  // uke body (bridge) hangs below-right of the cap. Offsets scale with apparent cap size.
-  function placeFrame(anchor, base) {
-    const scale = Math.min(1.6, Math.max(0.6, anchor.r / R_REF));
+  // Stillness detector. push() returns { still, forMs }. Both wrists must stay within stillTol of
+  // where they settled and the strumming tip must be clear of the strings; any violation restarts
+  // the clock, and a missing hand resets it.
+  function createStillness(opts = {}) {
+    const tol = opts.stillTol ?? params.stillTol, need = opts.stillMs ?? params.stillMs;
+    let refA = null, refB = null, since = 0;
     return {
-      bridge: { x: anchor.x + 0.22 * scale, y: anchor.y + 0.20 * scale },
-      length: base.length * scale,
-      spacing: base.spacing * scale,
-      scale,
+      push({ a, b, clear, aspect = 1, t }) {
+        if (!a || !b || !clear) { refA = refB = null; return { still: false, forMs: 0 }; }
+        if (!refA || isoDist(a, refA, aspect) > tol || isoDist(b, refB, aspect) > tol) {
+          refA = { x: a.x, y: a.y }; refB = { x: b.x, y: b.y }; since = t;
+        }
+        const forMs = t - since;
+        return { still: forMs >= need, forMs };
+      },
+      reset() { refA = refB = null; },
     };
   }
 
-  function drawMarker(ctx, a, w, h) {
-    if (!ctx || !a || !isFinite(a.x)) return;
-    const x = a.x * w, y = a.y * h, r = Math.max(6, a.r * h);
-    ctx.save();
-    ctx.strokeStyle = a.visible ? '#37d67a' : 'rgba(255,255,255,.4)';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(x, y, r * 1.4, 0, Math.PI * 2); ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(x - r * 0.6, y); ctx.lineTo(x + r * 0.6, y);
-    ctx.moveTo(x, y - r * 0.6); ctx.lineTo(x, y + r * 0.6);
-    ctx.stroke();
-    ctx.restore();
+  // Is the proposed frame different enough from the current one to be worth a move?
+  function worthMoving(cur, next, aspect = 1) {
+    return isoDist(cur.bridge, next.bridge, aspect) >= params.deadBridge ||
+           Math.abs(next.length / cur.length - 1) >= params.deadScale ||
+           Math.abs(next.angleDeg - cur.angleDeg) >= params.deadAngleDeg;
   }
 
-  // -------------------------------------------------------------- V10 self-test
-  function makeFrame(W, H, shapes) {
-    const data = new Uint8ClampedArray(W * H * 4);
-    for (let i = 0; i < W * H; i++) { data[4 * i] = 120; data[4 * i + 1] = 120; data[4 * i + 2] = 120; data[4 * i + 3] = 255; }
-    const put = (x, y, c) => { if (x < 0 || y < 0 || x >= W || y >= H) return; const i = 4 * (y * W + x); data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; };
-    for (const s of shapes) {
-      if (s.type === 'disc') {
-        for (let y = Math.floor(s.cy - s.r); y <= Math.ceil(s.cy + s.r); y++)
-          for (let x = Math.floor(s.cx - s.r); x <= Math.ceil(s.cx + s.r); x++)
-            if ((x - s.cx) ** 2 + (y - s.cy) ** 2 <= s.r * s.r) put(x, y, s.c);
-      } else if (s.type === 'rect') {
-        for (let y = s.y0; y <= s.y1; y++) for (let x = s.x0; x <= s.x1; x++) put(x, y, s.c);
-      }
-    }
-    return { data, width: W, height: H };
+  // Auto-fit controller. update(sample) takes one tracking sample and returns a proposed geometry
+  // (bridge, angleDeg, length, spacing, aspect, palm, scale; before layout) when a refit is due,
+  // else null. sample = { fretting, strumming: landmark arrays in screen coords or null,
+  // tipClear: strumming tip outside the string band, current: UkeFrame geometry, base, t: ms }.
+  function createAutoFit(opts = {}) {
+    const still = createStillness(opts);
+    const minInterval = opts.minIntervalMs ?? params.minIntervalMs;
+    let lastFitMs = -Infinity, count = 0, reason = 'waiting for both hands';
+    const spans = [];
+    return {
+      update(s) {
+        const aspect = s.current.aspect || 1;
+        const st = still.push({ a: s.fretting && s.fretting[0], b: s.strumming && s.strumming[0], clear: s.tipClear, aspect, t: s.t });
+        if (!st.still) {
+          spans.length = 0;
+          reason = !(s.fretting && s.strumming) ? 'waiting for both hands' : !s.tipClear ? 'strumming tip on the strings' : `still for ${Math.round(st.forMs)} ms`;
+          return null;
+        }
+        const sp = handSpan(s.fretting, s.strumming, aspect);
+        if (sp >= params.spanMin && sp <= params.spanMax) spans.push(sp);
+        if (spans.length > 60) spans.splice(0, spans.length - 60);
+        if (s.t - lastFitMs < minInterval) { reason = 'rate limited'; return null; }
+        if (spans.length < 4) { reason = 'measuring hand span'; return null; }
+        const sorted = spans.slice().sort((x, y) => x - y), span = sorted[sorted.length >> 1];   // median: robust to a bad frame
+        const size = sizeForSpan(span, s.base);
+        // neck passes through the fretting knuckles (9), strumming tip (8) parks above the strings over the body
+        const g = UkeFrame.recenterG({ ...s.current, length: size.length, spacing: size.spacing }, s.fretting[9], s.strumming[8]);
+        lastFitMs = s.t; still.reset(); spans.length = 0;
+        if (!worthMoving(s.current, g, aspect)) { reason = 'already fitted'; return null; }
+        count++; reason = `refit ${count}`;
+        return { ...g, span, scale: size.scale };
+      },
+      status() { return { count, reason }; },
+      reset() { still.reset(); spans.length = 0; },
+    };
   }
 
+  // Frame animator: eased glide between two geometries. at(t) returns the interpolated geometry
+  // with done:true on the final call; active() while a glide is in progress.
+  function createAnimator(animMs = params.animMs) {
+    let from = null, to = null, t0 = 0;
+    const ease = u => (u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2);   // ease-in-out
+    const lerp = (a, b, u) => a + (b - a) * u;
+    return {
+      start(f, target, t) {
+        from = { ...f, bridge: { ...f.bridge } };
+        to = { aspect: target.aspect ?? f.aspect, bridge: { ...target.bridge }, angleDeg: target.angleDeg, length: target.length, spacing: target.spacing };
+        t0 = t;
+      },
+      active() { return !!to; },
+      target() { return to; },
+      at(t) {
+        if (!to) return null;
+        const done = t - t0 >= animMs;
+        const u = done ? 1 : ease(clamp((t - t0) / animMs, 0, 1));
+        const g = {
+          aspect: to.aspect,
+          bridge: { x: lerp(from.bridge.x, to.bridge.x, u), y: lerp(from.bridge.y, to.bridge.y, u) },
+          angleDeg: lerp(from.angleDeg, to.angleDeg, u),
+          length: lerp(from.length, to.length, u),
+          spacing: lerp(from.spacing, to.spacing, u),
+          done,
+        };
+        if (done) from = to = null;
+        return g;
+      },
+      cancel() { from = to = null; },
+    };
+  }
+
+  // ---------------------------------------------------------------- V13 self-test (pure)
   function selfTest() {
     const lines = [];
     let pass = true;
-    const check = (ok, msg) => { pass = pass && !!ok; lines.push((ok ? 'PASS ' : 'FAIL ') + msg); };
-    const BLUE = [30, 80, 220], RED = [220, 40, 40];
-    const W = 160, H = 90;
-    const savedTarget = getTarget();
-    setTarget({ ...DEFAULT_TARGET });
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push(`${ok ? 'PASS' : 'FAIL'} ${msg}`); };
+    const base = { length: 0.66, spacing: 0.05 };
+    const aspect = 16 / 9;
 
-    const hsvBlue = rgbToHsv(0, 0, 255);
-    check(Math.abs(hsvBlue.h - 240) < 1e-9 && hsvBlue.s === 1 && hsvBlue.v === 1, `rgbToHsv(0,0,255) → h ${hsvBlue.h.toFixed(1)} s ${hsvBlue.s} v ${hsvBlue.v}`);
-    const capHsv = rgbToHsv(...BLUE);
-    check(hueDiff(capHsv.h, DEFAULT_TARGET.h) <= params.hueTol, `synthetic cap colour hue ${capHsv.h.toFixed(1)}° within ${params.hueTol}° of default target ${DEFAULT_TARGET.h}°`);
-
-    const frame = makeFrame(W, H, [
-      { type: 'disc', cx: 40, cy: 30, r: 6, c: BLUE },            // the cap
-      { type: 'disc', cx: 120, cy: 60, r: 1, c: BLUE },           // too small
-      { type: 'rect', x0: 90, y0: 40, x1: 150, y1: 80, c: BLUE }, // too large (61×41 = 2501 px > 288)
-      { type: 'disc', cx: 80, cy: 45, r: 6, c: RED },             // wrong colour
-    ]);
-    const m = mask(frame);
-    const at = (x, y) => m[y * W + x];
-    check(at(40, 30) === 1, 'mask: cap centre (40,30) is 1');
-    check(at(120, 40) === 1, 'mask: big blue rect (120,40) is 1 (colour matches, size filter is later)');
-    check(at(80, 45) === 0, 'mask: red disc (80,45) is 0');
-    check(at(10, 10) === 0, 'mask: grey background (10,10) is 0');
-
-    const bl = blobs(m, W, H);
-    check(bl.length === 1, `blobs: exactly one valid blob (got ${bl.length})`);
-    if (bl.length) {
-      const b = bl[0], expA = Math.PI * 36;
-      check(Math.abs(b.area - expA) / expA <= 0.15, `blobs: area ${b.area} within ±15% of π·36 = ${expA.toFixed(1)}`);
-      check(Math.abs(b.cx - 40) <= 1 && Math.abs(b.cy - 30) <= 1, `blobs: centroid (${b.cx.toFixed(2)}, ${b.cy.toFixed(2)}) within 1 px of (40,30)`);
+    // (a) size from the hand span: hands 0.51 frame heights apart → 0.60 neck; clamps both ways
+    {
+      const s = sizeForSpan(0.51, base);
+      check(Math.abs(s.length - 0.6) < 1e-9 && Math.abs(s.spacing / s.length - params.spacingRatio) < 1e-9,
+        `span 0.51 → length ${s.length.toFixed(3)} (span / 0.85), spacing/length ${(s.spacing / s.length).toFixed(4)}`);
+      check(Math.abs(sizeForSpan(0.1, base).scale - params.minScale) < 1e-9, `hands close together clamp to scale ${params.minScale}`);
+      check(Math.abs(sizeForSpan(1.4, base).scale - params.maxScale) < 1e-9, `hands far apart clamp to scale ${params.maxScale} (never bigger than the base)`);
+      const wide = sizeForSpan(0.50, base), narrow = sizeForSpan(0.40, base);
+      check(wide.length > narrow.length, `wider hand span gets a bigger uke: ${wide.length.toFixed(2)} > ${narrow.length.toFixed(2)}`);
     }
 
-    const tr = createTracker();
-    const t1 = tr.update(frame, 0);
-    check(t1.visible && Math.abs(t1.x - 0.75) < 0.01 && Math.abs(t1.y - 30 / 90) < 0.01, `tracker: mirrored x ${t1.x.toFixed(3)} ≈ 0.750, y ${t1.y.toFixed(3)} ≈ 0.333, visible`);
-    check(Math.abs(t1.r - 6 / 90) < 0.01, `tracker: r ${t1.r.toFixed(4)} ≈ ${(6 / 90).toFixed(4)} (radius / frame height)`);
+    // (b) stillness: jitter inside the tolerance fires at stillMs, a jump restarts, a tip on the strings never fires
+    {
+      let seed = 7; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+      const jit = (p, amp) => ({ x: p.x + (rnd() - 0.5) * amp, y: p.y + (rnd() - 0.5) * amp });
+      const A = { x: 0.3, y: 0.5 }, B = { x: 0.7, y: 0.5 };
+      const st = createStillness();
+      let firedAt = null;
+      for (let t = 0; t <= 2000 && firedAt == null; t += 33) { if (st.push({ a: jit(A, 0.006), b: jit(B, 0.006), clear: true, aspect, t }).still) firedAt = t; }
+      check(firedAt != null && firedAt >= params.stillMs && firedAt < params.stillMs + 70, `still hands with 0.6 % jitter fire at ${firedAt} ms (need ≥ ${params.stillMs})`);
+      const st2 = createStillness();
+      let fired2 = null;
+      for (let t = 0; t <= 3000 && fired2 == null; t += 33) {
+        const b = t >= 1000 ? { x: B.x + 0.03, y: B.y } : B;   // strumming wrist shifts 3 % at 1 s and stays there
+        if (st2.push({ a: A, b, clear: true, aspect, t }).still) fired2 = t;
+      }
+      check(fired2 != null && fired2 >= 1000 + params.stillMs, `a 3 % wrist move at 1 s restarts the clock (fired at ${fired2} ms)`);
+      const st3 = createStillness();
+      let fired3 = false;
+      for (let t = 0; t <= 4000; t += 33) if (st3.push({ a: A, b: B, clear: false, aspect, t }).still) fired3 = true;
+      check(!fired3, 'strumming tip on the strings → never fires, however long the hands are still');
+    }
 
-    const empty = makeFrame(W, H, []);
-    let te = null;
-    for (let i = 1; i <= 3; i++) te = tr.update(empty, 400 * i);
-    check(te && !te.visible && te.lostForMs === 1200 && Math.abs(te.x - t1.x) < 1e-12, `tracker: after 3 empty frames visible=false, lostForMs ${te && te.lostForMs}, position held`);
-    check(te.lostForMs >= params.lostMs, `tracker: lostForMs ${te.lostForMs} ≥ lostMs ${params.lostMs} → integrator would freeze`);
+    // (c) auto-fit end to end: still synthetic hands → exactly one proposal, then rate limit / dead band
+    {
+      const mkHand = (wrist, palm) => { const lm = new Array(21).fill(null).map(() => ({ x: wrist.x, y: wrist.y })); lm[0] = { ...wrist }; lm[9] = { x: wrist.x, y: wrist.y - palm }; lm[8] = { x: wrist.x, y: wrist.y - 1.9 * palm }; return lm; };
+      // fretting knuckles at (0.35, 0.43), strumming tip at (0.62, 0.55): span 0.495 iso → length 0.582, natural tilt −14° (inside the clamp)
+      const fret = mkHand({ x: 0.35, y: 0.55 }, 0.12), strum = mkHand({ x: 0.62, y: 0.778 }, 0.12);
+      const wantLen = Math.hypot((fret[9].x - strum[8].x) * aspect, fret[9].y - strum[8].y) / params.spanPerLength;
+      const current = { aspect, bridge: { x: 0.64, y: 0.62 }, angleDeg: -18, length: 0.66, spacing: 0.05 };
+      const af = createAutoFit();
+      const props = [];
+      for (let t = 0; t <= 2500; t += 33) { const p = af.update({ fretting: fret, strumming: strum, tipClear: true, current, base, t }); if (p) props.push({ t, p }); }
+      check(props.length === 1 && props[0].t >= params.stillMs, `one refit proposed after the still pose (at ${props[0] && props[0].t} ms, ${props.length} total)`);
+      const p = props[0] && props[0].p;
+      check(p && Math.abs(p.length - wantLen) < 1e-6 && p.scale < 1 && p.scale > params.minScale, `proposal sized from the hand span: length ${p && p.length.toFixed(3)} (span ${p && p.span.toFixed(3)} / 0.85), scale ${p && p.scale.toFixed(2)}`);
+      check(p && p.angleDeg <= UkeFrame.TILT_MIN_DEG && p.angleDeg >= UkeFrame.TILT_MAX_DEG, `proposal tilted like a held ukulele: ${p && p.angleDeg.toFixed(1)}° (floor ${UkeFrame.TILT_MIN_DEG}°)`);
+      if (p) {
+        const kn = UkeFrame.toLocalG(p, fret[9]);
+        check(Math.abs(kn.y - UkeFrame.RECENTER_TIP_Y(p.spacing)) < 1e-6 && kn.x > 0.9 * p.length, `neck passes the fretting knuckles just past the nut (local x ${kn.x.toFixed(3)} of L ${p.length.toFixed(3)})`);
+      }
+      if (p) {
+        const tipL = UkeFrame.toLocalG ? UkeFrame.toLocalG(p, strum[8]) : null;
+        check(tipL && Math.abs(tipL.x - 0.25 * p.length) < 1e-6 && Math.abs(tipL.y - UkeFrame.RECENTER_TIP_Y(p.spacing)) < 1e-6,
+          `strumming tip lands at 25 % of the neck, ${(-UkeFrame.RECENTER_TIP_Y(p.spacing) / p.spacing).toFixed(1)} spacings above the top string (local ${tipL && tipL.x.toFixed(3)}, ${tipL && tipL.y.toFixed(3)})`);
+      }
+      // holding still after the fit, with the frame now AT the proposal → no second proposal within 6 s
+      let again = 0;
+      for (let t = 2533; t <= 8500; t += 33) if (af.update({ fretting: fret, strumming: strum, tipClear: true, current: { ...current, ...p }, base, t })) again++;
+      check(again === 0, `hands still at the fitted frame → no further refits over 6 s (${again}); reason "${af.status().reason}"`);
+      // a small drift (1 % of the frame) is inside the dead band
+      const af2 = createAutoFit();
+      const near = { ...current, ...p, bridge: { x: p.bridge.x + 0.005, y: p.bridge.y } };
+      let moved = 0, sawDead = false;
+      for (let t = 0; t <= 2500; t += 33) { if (af2.update({ fretting: fret, strumming: strum, tipClear: true, current: near, base, t })) moved++; if (af2.status().reason === 'already fitted') sawDead = true; }
+      check(moved === 0 && sawDead, `1 % drift is inside the dead band → evaluated, judged "already fitted", no refit (${moved})`);
+    }
 
-    // Nearest-to-prev: cap moved 5 px right, same-size decoy far away (decoy is first in area order if slightly bigger)
-    const frame2 = makeFrame(W, H, [
-      { type: 'disc', cx: 45, cy: 30, r: 6, c: BLUE },
-      { type: 'disc', cx: 130, cy: 75, r: 6.5, c: BLUE },
-    ]);
-    const bl2 = blobs(mask(frame2), W, H);
-    const chosen = pick(bl2, { cx: 40, cy: 30 }, W);
-    check(bl2.length === 2 && chosen && Math.abs(chosen.cx - 45) <= 1, `pick: nearest-to-prev chooses moved cap at cx ${chosen && chosen.cx.toFixed(1)} (decoy at 130 is larger)`);
-    check(pick(bl2, null, W).cx > 100, 'pick: without prev, the largest blob wins');
-    const tr2 = createTracker();
-    tr2.update(frame, 0);
-    const t2 = tr2.update(frame2, 33);
-    check(t2.visible && t2.x > 0.70 && t2.x < 0.75, `tracker: follows moved cap (x ${t2.x.toFixed(3)}, EMA toward 0.719) not the decoy`);
+    // (d) animator: starts at the old frame, ends exactly at the new one, monotonic in between
+    {
+      const an = createAnimator(300);
+      const f = { aspect, bridge: { x: 0.6, y: 0.6 }, angleDeg: -18, length: 0.66, spacing: 0.05 };
+      const g = { aspect, bridge: { x: 0.7, y: 0.5 }, angleDeg: -10, length: 0.40, spacing: 0.03 };
+      an.start(f, g, 1000);
+      const a0 = an.at(1000), a1 = an.at(1100), a2 = an.at(1200), a3 = an.at(1300);
+      check(a0 && Math.abs(a0.bridge.x - 0.6) < 1e-9 && !a0.done, 'animator starts at the old frame');
+      check(a1.bridge.x > a0.bridge.x && a2.bridge.x > a1.bridge.x && a1.length < a0.length && a2.length < a1.length, 'glide is monotonic in position and size');
+      check(a3.done && Math.abs(a3.bridge.x - 0.7) < 1e-9 && Math.abs(a3.length - 0.40) < 1e-9 && Math.abs(a3.spacing - 0.03) < 1e-9 && !an.active(), 'animator ends exactly on the new frame and deactivates');
+    }
 
-    const base = { length: 0.55, spacing: 0.045 };
-    const p1 = placeFrame({ x: 0.5, y: 0.4, r: R_REF }, base);
-    check(Math.abs(p1.scale - 1) < 1e-12 && Math.abs(p1.bridge.x - 0.72) < 1e-12 && Math.abs(p1.bridge.y - 0.60) < 1e-12, `placeFrame: r = R_REF → scale 1, bridge (${p1.bridge.x.toFixed(2)}, ${p1.bridge.y.toFixed(2)})`);
-    check(placeFrame({ x: 0, y: 0, r: 0.001 }, base).scale === 0.6, 'placeFrame: tiny cap clamps scale to 0.6');
-    check(placeFrame({ x: 0, y: 0, r: 1 }, base).scale === 1.6, 'placeFrame: huge cap clamps scale to 1.6');
-    check(Math.abs(placeFrame({ x: 0, y: 0, r: R_REF * 1.2 }, base).length - 0.55 * 1.2) < 1e-12, 'placeFrame: length scales linearly with r');
+    // (e) a frame move must not pluck: the detector is reset when the move starts, so a tip whose
+    // local y jumped across all four strings (because the frame moved, not the hand) plays nothing
+    if (typeof Strum !== 'undefined') {
+      const det = Strum.createDetector({ stringYs: [-0.075, -0.025, 0.025, 0.075], zoneX: [0.03, 0.30], spacing: 0.05 });
+      let plucks = 0;
+      for (let i = 0; i < 6; i++) plucks += det.push({ x: 0.15, y: -0.16 + i * 0.001, t: i * 33 }).length;   // armed above the strings
+      det.reset();                                                                                          // frame move begins
+      for (let i = 0; i < 20; i++) plucks += det.push({ x: 0.15, y: 0.16, t: 300 + i * 33 }).length;          // same screen tip, now below the strings
+      check(plucks === 0, `stationary tip re-seen across the strings after a frame move → ${plucks} plucks`);
+    }
 
-    // click-to-sample: mirrored click on the cap should return the cap's hue
-    const sampled = sampleColorAt(frame, 1 - 40 / 159, 30 / 89, 2);
-    check(sampled && hueDiff(sampled.h, capHsv.h) < 2, `sampleColorAt (mirrored coords) hue ${sampled && sampled.h.toFixed(1)}° ≈ cap ${capHsv.h.toFixed(1)}°`);
-
-    // timing
-    const tt = createTracker();
-    const t0 = Date.now();
-    const N = 200;
-    for (let i = 0; i < N; i++) tt.update(frame, i * 33);
-    const msPer = (Date.now() - t0) / N;
-    check(msPer < 3, `timing: ${msPer.toFixed(3)} ms per update at 160×90 (< 3 ms)`);
-
-    setTarget(savedTarget);
-    lines.unshift(pass ? 'V10 ANCHOR OK' : 'V10 ANCHOR FAILED');
+    lines.unshift(pass ? 'V13 FIT OK' : 'V13 FIT FAILED');
     return { pass, lines };
   }
 
-  return { params, R_REF, DEFAULT_TARGET, rgbToHsv, hueDiff, sampleFrame, setTarget, getTarget, save, load,
-           sampleColorAt, mask, blobs, pick, createTracker, placeFrame, drawMarker, selfTest };
+  return { params, palmLength, handSpan, sizeForSpan, createStillness, worthMoving, createAutoFit, createAnimator, selfTest };
 })();
 
 
@@ -3116,18 +3325,19 @@ const Songs = (() => {
 // ==========================================================================
 // ============================================================================
 // render/ + input/ + verify/ + main  — wiring for uke.html
-// Depends on: Tuning, AudioEngine, Tracking, Chord, UkeFrame, Strum, Annot, Anchor, Songs
+// Depends on: Tuning, AudioEngine, Tracking, Chord, UkeFrame, Strum, Annot, Fit, Songs
 // ============================================================================
 const App = (() => {
   const $ = id => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), ctx2d = overlay.getContext('2d');
-  const el = { chord: $('chord'), conf: $('conf').firstElementChild, pitch: $('pitch'), pos: $('pos'), debug: $('debug'),
+  const el = { hud: $('hud'), chord: $('chord'), conf: $('conf').firstElementChild, pitch: $('pitch'), pos: $('pos'), debug: $('debug'),
                status: $('status'), start: $('start'), startBtn: $('startBtn'), startNote: $('startNote'),
                panel: $('panel'), panelBody: $('panelBody'), calib: $('calib'), help: $('help'), song: $('song') };
 
   const state = {
     started: false, cameraOn: false, trackingOn: false, debug: false,
     chord: 'open', confidence: 0, method: 'rules', curls: null,
+    prevDown: null,                 // rules hysteresis: last frame's down flags (index,middle,ring,pinky)
     keyboardChord: null,            // Q/W/E/R override; O releases
     sounding: null,                 // chord the engine is actually tuned to (after position gating)
     lastPlucks: [],                 // for the debug HUD (string, when)
@@ -3141,15 +3351,17 @@ const App = (() => {
     highlight: [false, false, false, false], highlightUntil: [0, 0, 0, 0],
     helpOn: false,
     song: null, songOn: false,      // Songs session
-    anchorOn: false, anchorArmed: false, anchor: null,   // blue-cap tracker
-    framePinned: false,             // anchor or C-recentre has placed the frame: resize must not move it
+    autoFit: true, fit: null,       // hands-free fit (Fit.createAutoFit): on/off (key A) and last status {count, reason}
+    framePinned: false,             // auto-fit or C-recentre has placed the frame: resize must not move it
     base: { length: 0.55, spacing: 0.05 },               // unscaled frame size from resize()
     lastSpacing: 0,
+    layout: null,                   // last UkeFrame.layout() verdict: { ok, scale, moved, obstacles }
   };
 
   const voter = Chord.createVoter({ window: 5, minVotes: 3, minConfidence: 0.5 });
   let detector = null;
-  let anchorTracker = null;
+  const autoFit = Fit.createAutoFit();
+  const animator = Fit.createAnimator();
 
   // ---------------------------------------------------------------- helpers
   const setStatus = s => { el.status.textContent = s; };
@@ -3203,7 +3415,7 @@ const App = (() => {
     return current;
   }
   // Position layer: is the fretting hand over the neck, and are its fingertips on the dots of the
-  // recognised chord? Runs every tracking frame after the frame may have moved (anchor).
+  // recognised chord? Runs every tracking frame after the frame may have moved (auto-fit glide).
   const FRET_LOST_GRACE_MS = 300;   // a hand dropped for a few frames keeps its verdict; longer = really gone
   let lastFrettingSeenMs = -Infinity;
   function updatePosition(nowMs) {
@@ -3293,15 +3505,14 @@ const App = (() => {
       await Tracking.startCamera(video, { width: 1280, height: 720 });   // 16:9 so cover-crop is minimal on laptops
       state.cameraOn = true;
       state.trackingOn = true;
-      anchorTracker = Anchor.createTracker();
       Tracking.onFrame(video, onTrack);
-      setStatus(`tracking via ${state.trackSource} · press B then click your blue cap to anchor the uke`);
+      setStatus(`tracking via ${state.trackSource} · hold both hands still for 2 s and the ukulele fits itself to you (A toggles, C recentres)`);
     } catch (e) {
       setStatus('no camera/tracker — keyboard + mouse mode (' + (e && e.message || e) + ')');
     }
   }
 
-  // ---------------------------------------------------------------- tracking → chord + strum + anchor
+  // ---------------------------------------------------------------- tracking → chord + auto-fit + strum
   function onTrack(result, nowMs) {
     state.fps = result.fps;
     const cm = coverMap();
@@ -3314,8 +3525,8 @@ const App = (() => {
 
     // Chord recognition from the fretting hand shape
     if (result.fretting && !state.calibrating) {
-      const r = Chord.classify(result.fretting.landmarks);
-      state.curls = r.curls; state.method = r.method;
+      const r = Chord.classify(result.fretting.landmarks, undefined, state.prevDown);
+      state.curls = r.curls; state.method = r.method; state.prevDown = r.down;
       const v = voter.push(r);
       state.confidence = v.confidence || 0;
       if (v.chord && v.chord !== state.chord) {
@@ -3324,27 +3535,25 @@ const App = (() => {
       }
     }
 
-    // Blue-cap anchor → instrument position and size
-    if (state.anchorOn && anchorTracker) {
-      const img = Anchor.sampleFrame(video, Anchor.params.scanW, Anchor.params.scanH);
-      if (img) {
-        const a = anchorTracker.update(img, nowMs);
-        const sp = cm.toScreen({ x: a.x, y: a.y });
-        state.anchor = { x: sp.x, y: sp.y, r: a.r * cm.rScale, visible: a.visible, lostForMs: a.lostForMs };
-        if (a.visible || a.lostForMs < Anchor.params.lostMs) {
-          const g = Anchor.placeFrame(state.anchor, state.base);
-          UkeFrame.set({ bridge: g.bridge, length: g.length, spacing: g.spacing });
-          state.framePinned = true;
-          if (Math.abs(g.spacing - state.lastSpacing) > 0.02 * state.lastSpacing) rebuildDetector();
-        }
-      }
+    // Hands-free fit: when both hands have been still with the strumming tip clear of the strings, size
+    // the instrument from the palms and place it between the hands (the key-C geometry), run it through
+    // the layout solver and glide there. The frame never follows a moving hand; it moves only in these
+    // discrete refits, and the strum detector is reset while it does.
+    if (state.autoFit && !animator.active()) {
+      const f = state.fretting, s = state.strumming;
+      let tipClear = false;
+      if (s) { const l = UkeFrame.toLocal(s.landmarks[8]); tipClear = Math.abs(l.y) > TIP_CLEAR_SPACINGS * UkeFrame.get().spacing; }
+      const prop = autoFit.update({ fretting: f && f.landmarks, strumming: s && s.landmarks, tipClear, current: UkeFrame.get(), base: state.base, t: nowMs });
+      state.fit = autoFit.status();
+      if (prop) beginFrameMove(prop, 'fitted to you (' + prop.scale.toFixed(2) + '×)');
     }
 
     // Position layer (after the frame may have moved)
     updatePosition(nowMs);
 
-    // Strum detection from the strumming index tip (landmark 8)
-    if (state.strumming) {
+    // Strum detection from the strumming index tip (landmark 8). Paused while the frame glides:
+    // a moving frame changes the tip's local y and would read as a crossing.
+    if (state.strumming && !animator.active()) {
       const lm = state.strumming.landmarks;
       // A wrist cannot translate 12% of the frame in one camera frame; if it did, the "strumming hand"
       // is a different hand (role swap / duplicate detection) and the ring buffer must not bridge them.
@@ -3367,27 +3576,72 @@ const App = (() => {
   }
   const WRIST_JUMP_MAX = 0.12;        // local units (frame heights) per tracking frame
   const STRUM_INDEX_MAX_CURL = 0.5;   // Chord.curls: 0 = straight, 1 = folded into the palm
+  const TIP_CLEAR_SPACINGS = 2.0;     // tip counts as "clear of the strings" beyond 2 spacings (band is 1.5 + 0.3 dead band)
+
+  // Move the instrument to a proposed geometry (from auto-fit or key C): layout-check it against the
+  // HUD and panels, reset the strum detector, glide over Fit.params.animMs. Returns false if there is no room.
+  function beginFrameMove(prop, why) {
+    const cur = UkeFrame.get();
+    const lay = UkeFrame.layout({ aspect: cur.aspect, base: { length: prop.length, spacing: prop.spacing }, avoid: layoutObstacles(),
+                                  defaults: { bridge: prop.bridge, angleDeg: prop.angleDeg } });
+    if (!lay.ok) { setStatus(why + ' — no room for the instrument there, kept where it is'); return false; }
+    animator.start(cur, lay, performance.now());
+    if (detector) detector.reset();
+    state.framePinned = true;
+    state.layout = { ok: true, scale: lay.scale, moved: lay.moved, pinned: true, hits: 0, obstacles: 0 };
+    setStatus(why + (lay.moved ? ' · nudged clear of the panels' : ''));
+    return true;
+  }
 
   // ---------------------------------------------------------------- render
+  // On-screen UI the instrument must not sit under, as normalised overlay rects with a 12 px margin.
+  // The overlay is position:fixed; inset:0, so client rects are overlay rects.
+  const LAYOUT_PAD_PX = 12;
+  function layoutObstacles() {
+    const sw = overlay.clientWidth || 1, sh = overlay.clientHeight || 1;
+    const els = [el.hud, el.status, $('keys'), state.helpOn ? el.help : null, state.songOn ? el.song : null].filter(Boolean);   // keycap chips bottom-right too
+    return els.map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0)
+      .map(r => ({ x0: (r.left - LAYOUT_PAD_PX) / sw, y0: (r.top - LAYOUT_PAD_PX) / sh, x1: (r.right + LAYOUT_PAD_PX) / sw, y1: (r.bottom + LAYOUT_PAD_PX) / sh }));
+  }
+  // Live layout verification (the runtime twin of V12): instrument bounds vs the real DOM rects.
+  function layoutCheck() {
+    const b = UkeFrame.boundsOf(UkeFrame.get());
+    const obstacles = layoutObstacles();
+    const hits = obstacles.filter(r => UkeFrame.intersects(b, r)).length;
+    const inside = b.x0 >= 0 && b.y0 >= 0 && b.x1 <= 1 && b.y1 <= 1;
+    return { ok: hits === 0 && inside, hits, inside, bounds: b, obstacles: obstacles.length };
+  }
+
   function resize() {
     overlay.width = overlay.clientWidth * devicePixelRatio;
     overlay.height = overlay.clientHeight * devicePixelRatio;
     // Isotropic geometry: with aspect set, lengths are in frame-heights, so a −15° neck is really 15° on screen.
     const aspect = overlay.clientWidth / Math.max(1, overlay.clientHeight);
     // Sized like a soprano uke held at chest height: neck ≈ 0.66 frame-heights, string spacing 0.05
-    // (fingertip-sized cells so position play is feasible), body right of centre at chest height.
-    // y = 0.62, not 0.80: at 0.80 the strings sat at lap height, right where a seated player's
-    // right hand rests and where hands enter the frame.
+    // (fingertip-sized cells so position play is feasible). Placement is chosen by UkeFrame.layout so
+    // the whole instrument (annotations included) stays clear of the HUD, status bar and open panels
+    // and inside the window — on a short, wide window the default would put the nut under the chord card.
     state.base = { length: Math.min(0.66, 0.38 * aspect), spacing: 0.05 };
-    const geo = { aspect, length: state.base.length, spacing: state.base.spacing };
-    if (!state.framePinned) Object.assign(geo, { bridge: { x: 0.64, y: 0.62 }, angleDeg: -18 });   // anchor / C own the placement otherwise
-    UkeFrame.set(geo);
+    if (!state.framePinned) {                                        // auto-fit / C own the placement otherwise
+      const lay = UkeFrame.layout({ aspect, base: state.base, avoid: layoutObstacles() });
+      UkeFrame.set({ aspect, bridge: lay.bridge, angleDeg: lay.angleDeg, length: lay.length, spacing: lay.spacing });
+      state.layout = { ok: lay.ok, scale: lay.scale, moved: lay.moved, ...layoutCheck() };
+    } else {
+      UkeFrame.set({ aspect });
+      const lc = layoutCheck();                                      // informational: the user chose this placement
+      state.layout = { ...lc, ok: true, scale: 1, moved: false, pinned: true };
+    }
     if (detector) rebuildDetector();
   }
   window.addEventListener('resize', resize);
 
   function renderLoop() {
     const w = overlay.width, h = overlay.height, now = performance.now();
+    if (animator.active()) {                     // frame glide (auto-fit / C): geometry updates here, at render rate
+      const g = animator.at(now);
+      UkeFrame.set(g);
+      if (g.done) { rebuildDetector(); state.layout = { ...state.layout, ...layoutCheck() }; }
+    }
     ctx2d.clearRect(0, 0, w, h);
     for (let i = 0; i < 4; i++) state.highlight[i] = state.highlightUntil[i] > now;
     UkeFrame.draw(ctx2d, w, h, { highlight: state.highlight });
@@ -3399,13 +3653,12 @@ const App = (() => {
     }
     if (state.fretting) Tracking.drawLandmarks(ctx2d, state.fretting, w, h, '#4fc3f7');
     if (state.strumming) Tracking.drawLandmarks(ctx2d, state.strumming, w, h, '#ffb74d');
-    if (state.anchorOn && state.anchor) Anchor.drawMarker(ctx2d, state.anchor, w, h);
 
     el.conf.style.width = Math.round(100 * Math.min(1, state.confidence)) + '%';
     el.conf.style.background = state.confidence >= 0.5 ? 'var(--ok)' : 'var(--accent)';
 
     const lr = AudioEngine.liveReadout && AudioEngine.liveReadout();
-    if (lr && lr.measuredHz) {
+    if (lr && lr.measuredHz && lr.targetHz != null && lr.cents != null) {   // no target yet (e.g. ringing after a retune) → keep the last readout
       const ok = Math.abs(lr.cents) <= 3;
       el.pitch.innerHTML = `target <b>${lr.targetHz.toFixed(2)} Hz</b> · measured <b>${lr.measuredHz.toFixed(2)} Hz</b> · ` +
         `<span class="${ok ? 'ok' : 'bad'}">${lr.cents >= 0 ? '+' : ''}${lr.cents.toFixed(1)} cents</span> · ${lr.note || ''}`;
@@ -3419,7 +3672,7 @@ const App = (() => {
     }
 
     if (state.debug) {
-      const c = state.curls, a = state.anchor, m = state.match;
+      const c = state.curls, m = state.match;
       el.debug.textContent =
         `fps ${state.fps.toFixed(0)}   src ${state.trackSource}   video ${video.videoWidth}x${video.videoHeight}\n` +
         `method ${state.method}   kb ${state.keyboardChord || '-'}   target ${targetChord()}   sounding ${state.sounding}\n` +
@@ -3427,8 +3680,9 @@ const App = (() => {
         `position ${state.position || '-'}  overNeck ${state.overNeck}  ` +
         (m && m.dots.length ? `dn ${m.dots.map(d => 'f' + d.finger + ':' + (Number.isFinite(d.dn) ? d.dn.toFixed(2) : '∞')).join(' ')}` : 'no dots') +
         `  strum armed ${detector && detector.isArmed ? detector.isArmed() : '-'}  v ${detector ? detector.lastVelocity().toFixed(2) : '-'}\n` +
-        (a ? `anchor ${a.visible ? 'seen' : 'lost ' + a.lostForMs.toFixed(0) + 'ms'} x ${a.x.toFixed(3)} y ${a.y.toFixed(3)} r ${a.r.toFixed(4)}\n` : '') +
+        `fit ${state.autoFit ? 'auto' : 'off'}  ${state.fit ? state.fit.reason + '  refits ' + state.fit.count : '-'}  gliding ${animator.active()}\n` +
         `last plucks ${state.lastPlucks.map(p => p.string + '@' + p.when.toFixed(3)).join(' ')}\n` +
+        (state.layout ? `layout ${state.layout.ok ? 'OK' : 'OVERLAP'} scale ${state.layout.scale} ${state.layout.moved ? 'moved' : 'default'} hits ${state.layout.hits} obstacles ${state.layout.obstacles}${state.layout.pinned ? ' (pinned)' : ''}\n` : '') +
         `frame ${JSON.stringify(UkeFrame.get())}`;
     }
     requestAnimationFrame(renderLoop);
@@ -3469,6 +3723,7 @@ const App = (() => {
     } else {
       state.songOn = false; el.song.classList.remove('on'); $('stage').classList.remove('song-on');
     }
+    if (state.started) resize();   // the song panel is a layout obstacle
   }
 
   // "How to play it" hint inside the song panel: mini diagram + the hand rule + what the camera sees.
@@ -3519,8 +3774,9 @@ const App = (() => {
     safe('V4', () => Strum.selfTest());
     safe('V8', () => Chord.selfTest());
     safe('V9', () => Songs.selfTest());
-    safe('V10', () => Anchor.selfTest());
     safe('V11', () => Annot.selfTest());
+    safe('V12', () => UkeFrame.selfTest());
+    safe('V13', () => Fit.selfTest());
     try { results.push(await AudioEngine.selfTestV2()); }
     catch (e) { results.push({ pass: false, lines: ['V2 PITCH FAILED — ' + (e && e.message || e)] }); }
     const pass = results.every(r => r.pass);
@@ -3546,7 +3802,7 @@ const App = (() => {
     if (k === 'v') { if (el.panel.classList.contains('on')) el.panel.classList.remove('on'); else selfTest(); return; }
     if (k === 'escape') { el.panel.classList.remove('on'); return; }
     if (k === 'd') { state.debug = !state.debug; el.debug.classList.toggle('on', state.debug); return; }
-    if (ev.key === '?' || k === '/') { state.helpOn = !state.helpOn; el.help.classList.toggle('on', state.helpOn); $('stage').classList.toggle('help-on', state.helpOn); return; }
+    if (ev.key === '?' || k === '/') { state.helpOn = !state.helpOn; el.help.classList.toggle('on', state.helpOn); $('stage').classList.toggle('help-on', state.helpOn); if (state.started) resize(); return; }   // panel is a layout obstacle
     if (!state.started) return;
     if (k >= '1' && k <= '4') { firePlucks([{ string: 4 - Number(k), velocity: 0.8, when: AudioEngine.now() }]); }  // 4 = G top, 1 = A bottom
     else if (k === ' ') { ev.preventDefault(); strumChord(ev.shiftKey ? -1 : +1); }
@@ -3556,39 +3812,21 @@ const App = (() => {
     else if (k === 's') { toggleSong(); }
     else if (k === 'm' && state.song) { const m = state.song.state().mode === 'practice' ? 'playalong' : 'practice'; state.song.setMode(m); state.song.start(performance.now()); setStatus('song mode: ' + m); }
     else if (k === 'n' && state.song) { state.song.skip(+1); }
-    else if (k === 'b') {
-      if (!state.cameraOn) { setStatus('cap anchor needs the camera'); return; }
-      if (state.anchorOn) { state.anchorOn = false; state.anchorArmed = false; setStatus('cap anchor off — instrument stays where it is'); }
-      else { state.anchorArmed = true; setStatus('click on your blue pen cap…'); }
-    }
+    else if (k === 'a') { state.autoFit = !state.autoFit; autoFit.reset(); setStatus(state.autoFit ? 'auto-fit on — hold both hands still to fit the ukulele' : 'auto-fit off — C recentres by hand'); }
     else if (k === 'c') {
-      if (state.fretting && state.strumming) { UkeFrame.recenter(state.fretting.landmarks[0], state.strumming.landmarks[8]); state.framePinned = true; rebuildDetector(); setStatus('recentred'); }
+      if (state.fretting && state.strumming) beginFrameMove(UkeFrame.recenterG(UkeFrame.get(), state.fretting.landmarks[9], state.strumming.landmarks[8]), 'recentred between your hands');
+      else setStatus('recentre needs both hands on camera');
     }
   });
   // Shift+R clears calibration only with Shift to avoid accidents
   window.addEventListener('keydown', ev => { if (ev.key === 'R' && ev.shiftKey) { Chord.calib.clear(); voter.reset(); setStatus('calibration cleared — rules mode'); } });
 
-  // Mouse: armed → sample the cap colour; otherwise a primary-button drag = strumming fingertip through
-  // the same detector. The drag ends on ANY of pointerup / pointercancel / lost capture / window blur /
-  // button no longer held, so a stuck "down" can never turn hovering into strumming.
+  // Mouse: a primary-button drag = strumming fingertip through the same detector. The drag ends on
+  // ANY of pointerup / pointercancel / lost capture / window blur / button no longer held, so a stuck
+  // "down" can never turn hovering into strumming.
   let mouseDown = false;
   const endDrag = () => { if (mouseDown && detector) detector.reset(); mouseDown = false; };
   overlay.addEventListener('pointerdown', ev => {
-    if (state.anchorArmed) {
-      const img = Anchor.sampleFrame(video, Anchor.params.scanW, Anchor.params.scanH);
-      if (!img) { setStatus('no video frame yet'); return; }
-      // Undo the cover-crop to get video-normalised coords (mirrored) for the sampler
-      const cm = coverMap();
-      const vw = video.videoWidth, vh = video.videoHeight, sw = overlay.clientWidth, sh = overlay.clientHeight;
-      const s = Math.max(sw / vw, sh / vh), dw = vw * s, dh = vh * s, ox = (sw - dw) / 2, oy = (sh - dh) / 2;
-      const nx = (ev.clientX - ox) / dw, ny = (ev.clientY - oy) / dh;
-      const hsv = Anchor.sampleColorAt(img, nx, ny, 2);
-      Anchor.setTarget(hsv); Anchor.save();
-      anchorTracker.reset();
-      state.anchorArmed = false; state.anchorOn = true;
-      setStatus(`cap colour sampled (hue ${hsv.h.toFixed(0)}°) — instrument now follows the cap · B to stop`);
-      return;
-    }
     if (ev.button !== 0 || !ev.isPrimary) return;          // left button only; no right-click / second touch
     mouseDown = true; detector && detector.reset();
     try { overlay.setPointerCapture(ev.pointerId); } catch (_) { /* not all pointers support capture */ }
@@ -3610,19 +3848,19 @@ const App = (() => {
   el.startBtn.addEventListener('click', start);
   if (location.protocol === 'file:') el.startNote.textContent = 'Running from file:// — hand tracker loads from the internet. For offline use run run.bat.';
   Chord.calib.load();
-  Anchor.load();
+  try { localStorage.removeItem('uke.anchor.v1'); } catch (_) { /* blue-cap anchor removed 20 Sept: drop its stored colour */ }
   if (new URLSearchParams(location.search).get('selftest') === '1') {
     // Self-test needs no camera and no user gesture (OfflineAudioContext).
     el.start.style.display = 'none';
     selfTest();
   }
   // onTrack / soundingChord / coverMap are exposed so a headless smoke test can drive the live path with synthetic hands.
-  return { state, start, selfTest, calibrate, toggleSong, updateSongHint, onTrack, soundingChord, coverMap };
+  return { state, start, selfTest, calibrate, toggleSong, updateSongHint, onTrack, soundingChord, coverMap, layoutCheck, resize, beginFrameMove };
 })();
 
 
 // Expose the sections for DevTools / screenshot tooling (module scope is otherwise private).
-window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Anchor, Songs };
+window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Fit, Songs };
 </script>
 </body>
 </html>

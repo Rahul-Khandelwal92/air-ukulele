@@ -39,7 +39,7 @@ A webcam, a browser, one file. No install, no hardware, no account.
 - **A strum is faster than the camera.** Four strings are crossed in about 60 ms, which is two webcam frames. We reconstruct the finger's path between frames and compute exactly when it crossed each string, so four notes play from two pictures.
 - **Hands come in every size and angle.** Landmarks are re-centred on the wrist, rotated and scaled before anything is classified, so the same rule works for everyone.
 - **Realistic sound with zero samples.** Physically modelled strings and a body resonance, rendered offline and measured with a spectrum analyser to confirm the pitch.
-- **The instrument follows you.** Clip a blue pen cap to your shirt, click it once, and the ukulele tracks your body in position and size.
+- **The instrument fits you.** Hold both hands still for two seconds and the ukulele sizes itself from your palm and settles between your hands. Step back and it shrinks; lean in and it grows.
 
 ## Why Fable 5.1 was needed
 
@@ -64,7 +64,7 @@ The result: roughly 150 KB of code built in a day, in which every musical claim 
 1. Open `dist/Air-Ukulele.html` in Chrome, click **Start**, allow the camera.
 2. Left hand up, palm to camera. Curl only the middle finger: **Am**. Ring only: **C**. Index and middle: **F**. Index, middle and ring: **G**.
 3. Sweep your right index finger down across the strings.
-4. **?** for chord help · **S** for the song · **B** then click a blue cap to anchor · **V** for the self-test.
+4. **?** for chord help · **S** for the song · **C** to recentre by hand · **V** for the self-test.
 
 ## Two-minute demo script
 
