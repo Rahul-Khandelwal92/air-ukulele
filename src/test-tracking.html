@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tracking/ test</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px/1.4 system-ui, sans-serif; }
+  #wrap { position: relative; width: 640px; height: 480px; margin: 12px; }
+  video, canvas { position: absolute; left: 0; top: 0; width: 640px; height: 480px; }
+  video { transform: scaleX(-1); }
+  #hud { margin: 12px; white-space: pre; }
+  button { font-size: 16px; padding: 8px 16px; margin: 12px; }
+</style>
+</head>
+<body>
+<button id="start">Start camera</button>
+<div id="wrap">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay" width="640" height="480"></canvas>
+</div>
+<div id="hud">init: pending</div>
+<script src="tracking.js"></script>
+<script>
+  Tracking.vendorPath = '../vendor';   // this page lives in src/
+  // ?cdn=1 forces the vendor path to fail so the CDN fallback is exercised over http.
+  if (location.search.includes('cdn=1')) Tracking.vendorPath = '../no-such-vendor';
+  const hud = document.getElementById('hud');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const log = (s) => { hud.textContent = s; };
+
+  // Auto-init on load (no camera) so headless Chrome can confirm the load path.
+  Tracking.init({ onStatus: (m) => log('init: ' + m) })
+    .then(({ source, delegate }) => { log(`INIT OK source=${source} delegate=${delegate}`); })
+    .catch((e) => { log('INIT FAIL ' + (e && e.message ? e.message : e)); });
+
+  document.getElementById('start').onclick = async () => {
+    if (!Tracking.isReady()) { log('not ready yet'); return; }
+    const { width, height } = await Tracking.startCamera(video, { width: 640, height: 480 });
+    canvas.width = width; canvas.height = height;
+    Tracking.onFrame(video, (res) => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      Tracking.drawLandmarks(ctx, res.fretting, canvas.width, canvas.height, '#4cf');   // fretting = blue
+      Tracking.drawLandmarks(ctx, res.strumming, canvas.width, canvas.height, '#fa4');  // strumming = orange
+      const f = res.fretting ? `fretting  wrist=(${res.fretting.landmarks[0].x.toFixed(2)},${res.fretting.landmarks[0].y.toFixed(2)}) mp=${res.fretting.handedness}` : 'fretting  —';
+      const s = res.strumming ? `strumming tip=(${res.strumming.landmarks[8].x.toFixed(2)},${res.strumming.landmarks[8].y.toFixed(2)}) mp=${res.strumming.handedness}` : 'strumming —';
+      log(`source=${Tracking.source} delegate=${Tracking.delegate} fps=${res.fps.toFixed(1)}\n${f}\n${s}\n[H] swap roles`);
+    });
+  };
+  window.addEventListener('keydown', (e) => { if (e.key === 'h' || e.key === 'H') Tracking.setSwap(!Tracking.getSwap()); });
+</script>
+</body>
+</html>

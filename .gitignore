@@ -1,0 +1,13 @@
+# personal scratch notes, not part of the project
+notepad.md
+build-day-ideas.md
+hackathon2.md
+
+# headless Chrome profile dirs / temp output
+chrome-profile*/
+*.log
+Thumbs.db
+.DS_Store
+
+# build artefacts from the screenshot tool
+src/shot-*.png

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>tracking/ headless init check</title></head>
+<body>
+<pre id="hud">pending</pre>
+<script src="tracking.js"></script>
+<!-- Module script with top-level await: the load event waits for it, so
+     headless --dump-dom sees the final status even over file:// -->
+<script type="module">
+  Tracking.vendorPath = '../vendor';
+  if (location.search.includes('cdn=1')) Tracking.vendorPath = '../no-such-vendor';
+  const hud = document.getElementById('hud');
+  const t0 = performance.now();
+  try {
+    const { source, delegate } = await Tracking.init({ onStatus: (m) => { hud.textContent = 'init: ' + m; } });
+    hud.textContent = `INIT OK source=${source} delegate=${delegate} protocol=${location.protocol} ms=${Math.round(performance.now() - t0)}`;
+  } catch (e) {
+    hud.textContent = 'INIT FAIL ' + (e && e.message ? e.message : e);
+  }
+</script>
+</body>
+</html>

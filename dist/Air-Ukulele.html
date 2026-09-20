@@ -1,0 +1,3650 @@
+<!--
+  Air Ukulele — a webcam air ukulele in one file
+  Claude Build Day · New Delhi · 19 Sept 2026 · built with Claude Code on Fable 5.1
+
+  HOW TO RUN
+    1. Open this file in Google Chrome (double-click). Internet is needed once: the hand tracker
+       (Google MediaPipe, ~17 MB) loads from its official CDN and is then cached by the browser.
+    2. Click "Start — camera + sound" and allow the camera.
+    3. Left hand in the left half of the screen makes the chord shape; right index finger sweeps
+       across the strings to strum. Press ? for chord help, S for the Rasputin practice song,
+       B then click a blue pen cap on your shirt to make the instrument follow you, V for the self-test.
+    Keyboard fallback without a camera: Q W E R = C G Am F, Space = strum, 1–4 = pluck a string.
+
+  WHAT IS INSIDE (no samples, no frameworks, nothing else external)
+    · Four Karplus-Strong strings with fractional delay, body resonance and a soft limiter, in an AudioWorklet
+    · MediaPipe two-hand tracking; roles assigned by screen side; cover-crop mapping to the display
+    · Chord recognition from finger curl in a hand-normalised frame (rules), optional 15 s calibration
+    · Sub-frame strum detection: crossing times solved between camera frames, plucks scheduled with the real rake
+    · Blue-cap body anchor (HSV blob tracking), on-instrument fingering annotations, help panel, song practice mode
+    · Self-test (append ?selftest=1 or press V): every note verified against real ukulele pitch within 3 cents,
+      chord recogniser, strum timing, song data, anchor detector and annotations all checked with printed results
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Ukulele</title>
+<!-- ============================================================================
+     1. <style>  — design system: dark glass surfaces, one amber accent, 8-pt grid.
+     ============================================================================ -->
+<style>
+  :root {
+    --bg: #07080a;
+    --fg: #f6f4ef;
+    --muted: rgba(255,255,255,.6);
+    --faint: rgba(255,255,255,.32);
+    --accent: #f5b74a;
+    --accent-ink: #1a1206;
+    --ok: #4cd977;
+    --bad: #ff5f6d;
+    --glass: rgba(12,14,18,.55);
+    --glass-strong: rgba(12,14,18,.78);
+    --line: rgba(255,255,255,.08);
+    --line-strong: rgba(255,255,255,.14);
+    --radius: 16px;
+    --radius-sm: 10px;
+    --sans: "Segoe UI Variable Display", "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+    --shadow: 0 8px 32px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); overflow: hidden; -webkit-font-smoothing: antialiased; }
+  #stage { position: fixed; inset: 0; }
+  #video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #video { object-fit: cover; transform: scaleX(-1); filter: brightness(.65) saturate(.85); }
+  #overlay { object-fit: cover; }
+
+  .glass { background: var(--glass); backdrop-filter: blur(14px) saturate(1.1); -webkit-backdrop-filter: blur(14px) saturate(1.1);
+           border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+
+  /* ---- brand wordmark ---- */
+  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
+  #brand .mark { display: flex; align-items: center; gap: 10px; }
+  #brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #ffd27a, var(--accent) 60%, #d98f1f);
+                 box-shadow: 0 2px 10px rgba(245,183,74,.35); position: relative; flex: none; }
+  #brand .logo::before, #brand .logo::after { content: ""; position: absolute; left: 7px; right: 7px; height: 1.5px; background: var(--accent-ink); opacity: .85; border-radius: 1px; }
+  #brand .logo::before { top: 10px; } #brand .logo::after { top: 16px; }
+  #brand .name { font-size: 20px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; }
+  #brand .name b { font-weight: 700; color: var(--accent); }
+  #brand .tag { font-size: 11.5px; color: var(--muted); letter-spacing: .04em; padding-left: 38px; }
+
+  /* ---- HUD (top-left) ---- */
+  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 12px; width: min(360px, 34vw); min-width: 300px; }
+  #hud .card { padding: 16px 20px 18px; }
+  #hud .label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); margin-bottom: 2px; }
+  #chord { font-size: clamp(64px, 9vw, 120px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+           padding: 4px 6px 6px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
+  #chord.stale { color: var(--muted); }
+  #chord.off { color: var(--accent); }
+  #pos { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 1.3em; line-height: 1.3; }
+  #pos.ok { color: var(--ok); } #pos.warn { color: var(--accent); }
+  .confrow { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .confrow .label { margin: 0; flex: none; }
+  #conf { flex: 1; height: 6px; background: rgba(255,255,255,.12); border-radius: 3px; overflow: hidden; }
+  #conf > i { display: block; height: 100%; width: 0; background: var(--ok); border-radius: 3px; transition: width .12s linear, background .2s ease; }
+  #pitch { padding: 10px 16px; font-size: 13px; color: var(--muted); border-radius: 999px; display: inline-flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-variant-numeric: tabular-nums; }
+  #pitch b { color: var(--fg); font-weight: 600; }
+  #pitch .ok { color: var(--ok); font-weight: 600; } #pitch .bad { color: var(--bad); font-weight: 600; }
+
+  /* ---- right-side panels filled by other modules ---- */
+  #help { position: absolute; top: 24px; right: 24px; width: 300px; max-height: calc(100% - 200px); overflow: auto; z-index: 6; padding: 14px; display: none;
+          background: var(--glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); scrollbar-width: thin; }
+  #help.on { display: block; }
+  /* Song helper lives in the right column (never over the instrument). Stacks under #help when both are open. */
+  #stage #song { position: absolute; left: auto; right: 24px; top: 24px; bottom: 72px; width: 300px; height: auto; z-index: 6; display: none; padding: 16px 18px; overflow: auto; scrollbar-width: thin;
+          background: var(--glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  #stage #song.on { display: flex; flex-direction: column; justify-content: flex-start; align-items: stretch; gap: 14px; }
+  #stage.help-on #song.on { top: calc(46% + 12px); }
+  #stage.song-on #help { max-height: calc(46% - 24px); }
+  #stage #song .sg-left, #stage #song .sg-centre, #stage #song .sg-right { text-align: left; min-width: 0; }
+  #stage #song .sg-centre { padding: 10px 0 6px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  #stage #song .sg-target { font-size: clamp(56px, 6vw, 84px); letter-spacing: -.02em; }
+  #stage #song .sg-target.match { color: var(--ok); }
+  #stage #song .sg-next { justify-content: flex-start; flex-wrap: wrap; gap: 8px; }
+  #stage #song .sg-title { font-size: 17px; }
+  #stage #song .sg-meta, #stage #song .sg-note, #stage #song .sg-progress, #stage #song .sg-sub { color: var(--muted); }
+
+  /* ---- debug (bottom-right) ---- */
+  #debug { position: absolute; right: 24px; bottom: 72px; z-index: 5; display: none; padding: 10px 14px; font: 11.5px/1.55 var(--mono); color: var(--muted); white-space: pre; text-align: left;
+           background: var(--glass-strong); border: 1px solid var(--line); border-radius: var(--radius-sm); max-width: 46vw; overflow: hidden; }
+  #debug.on { display: block; }
+
+  /* ---- bottom bar: status pill + keycap chips ---- */
+  #status { position: absolute; left: 24px; bottom: 24px; z-index: 5; max-width: 30vw; padding: 7px 12px 7px 10px; font-size: 12px; color: var(--muted); border-radius: 999px;
+            background: var(--glass); border: 1px solid var(--line); display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 rgba(245,183,74,.6); animation: pulse 1.8s ease-out infinite; flex: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(245,183,74,.55); } 70% { box-shadow: 0 0 0 7px rgba(245,183,74,0); } 100% { box-shadow: 0 0 0 0 rgba(245,183,74,0); } }
+  #keys { position: absolute; right: 24px; bottom: 24px; z-index: 5; display: flex; gap: 6px; flex-wrap: nowrap; padding: 6px 8px; border-radius: 999px;
+          background: var(--glass); border: 1px solid var(--line); max-width: calc(68vw - 48px); overflow: hidden; }
+  #keys .kc { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 3px 8px 3px 3px; border-radius: 999px; white-space: nowrap; }
+  #keys kbd { font: 11px/1 var(--mono); color: var(--fg); background: rgba(255,255,255,.1); border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 6px; padding: 4px 6px; min-width: 22px; text-align: center; }
+  @media (max-width: 1400px) { #keys .kc.opt { display: none; } }
+
+  /* ---- start overlay ---- */
+  #start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 10; background: rgba(4,5,7,.45); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+  #start .card { width: min(520px, calc(100vw - 48px)); padding: 36px 40px 32px; display: flex; flex-direction: column; align-items: flex-start; gap: 14px; background: var(--glass-strong); }
+  #start #brand { margin-bottom: 4px; }
+  #start #brand .name { font-size: 34px; letter-spacing: .1em; }
+  #start #brand .logo { width: 40px; height: 40px; border-radius: 11px; }
+  #start #brand .logo::before, #start #brand .logo::after { left: 10px; right: 10px; height: 2px; } #start #brand .logo::before { top: 15px; } #start #brand .logo::after { top: 23px; }
+  #start #brand .tag { padding-left: 50px; font-size: 12.5px; }
+  #start p { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; max-width: 46ch; }
+  #start button { margin-top: 8px; font: 600 16px var(--sans); letter-spacing: .01em; padding: 14px 26px; border-radius: 12px; border: 0; cursor: pointer; color: var(--accent-ink);
+                  background: linear-gradient(180deg, #ffd27a, var(--accent)); box-shadow: 0 6px 24px rgba(245,183,74,.3), inset 0 1px 0 rgba(255,255,255,.35); transition: transform .12s ease, box-shadow .12s ease; }
+  #start button:hover { transform: translateY(-1px); box-shadow: 0 10px 28px rgba(245,183,74,.38), inset 0 1px 0 rgba(255,255,255,.35); }
+  #start button:disabled { opacity: .6; cursor: default; transform: none; }
+  #start #startNote { font-size: 12px; color: var(--faint); }
+  #start #startNote:empty { display: none; }
+  #start .hint { display: flex; gap: 16px; font-size: 12px; color: var(--faint); margin-top: 2px; }
+  #start .hint span::before { content: "•"; color: var(--accent); margin-right: 6px; }
+
+  /* ---- self-test / report panel ---- */
+  #panel { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(4,5,7,.6); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  #panel.on { display: flex; }
+  #panel .sheet { position: relative; width: min(960px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: auto; padding: 24px 28px 28px; background: var(--glass-strong); scrollbar-width: thin; }
+  #panel .close { position: absolute; top: 18px; right: 22px; color: var(--muted); font-size: 12px; }
+  #panel pre { font: 12px/1.5 var(--mono); margin: 0; white-space: pre-wrap; color: rgba(255,255,255,.82); }
+  #panel .banner { font: 700 22px var(--sans); padding: 10px 16px; border-radius: 12px; margin: 0 0 16px; display: inline-block; letter-spacing: .01em; }
+  #panel .banner.pass { background: var(--ok); color: #05210f; } #panel .banner.fail { background: var(--bad); color: #2a0509; }
+
+  /* ---- calibration overlay ---- */
+  #calib { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); z-index: 15; display: none; text-align: center; padding: 36px 56px 28px; min-width: 340px; background: var(--glass-strong); }
+  #calib.on { display: block; }
+  #calib .step { font-size: 11px; text-transform: uppercase; letter-spacing: .16em; color: var(--muted); margin-bottom: 6px; }
+  #calib .big { font-size: 128px; font-weight: 700; line-height: 1; letter-spacing: -.02em; }
+  #calib .count { font-size: 44px; font-weight: 600; color: var(--accent); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  #calib p { color: var(--muted); margin: 10px 0 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="hud">
+    <div id="brand">
+      <div class="mark"><span class="logo"></span><span class="name">Air <b>Ukulele</b></span></div>
+      <div class="tag">webcam · physically modelled · Claude Build Day</div>
+    </div>
+    <div class="card glass">
+      <div class="label">Chord</div>
+      <div id="chord" class="stale">—</div>
+      <div class="confrow"><span class="label">confidence</span><div id="conf"><i></i></div></div>
+      <div id="pos"></div>
+    </div>
+    <div id="pitch" class="glass">pluck a string to see pitch</div>
+  </div>
+
+  <div id="debug"></div>
+  <div id="help"></div>
+  <div id="song"></div>
+
+  <div id="calib" class="glass">
+    <div class="step">Calibration · hold the shape</div>
+    <div class="big">C</div>
+    <div class="count">3</div>
+    <p>make the chord shape with your left hand</p>
+  </div>
+
+  <div id="status">idle</div>
+  <div id="keys">
+    <span class="kc"><kbd>1–4</kbd>pluck</span>
+    <span class="kc"><kbd>Space</kbd>strum</span>
+    <span class="kc"><kbd>Q W E R</kbd>chords</span>
+    <span class="kc opt"><kbd>O</kbd>open</span>
+    <span class="kc"><kbd>?</kbd>help</span>
+    <span class="kc"><kbd>S</kbd>song</span>
+    <span class="kc opt"><kbd>M</kbd>mode</span>
+    <span class="kc"><kbd>B</kbd>cap anchor</span>
+    <span class="kc"><kbd>K</kbd>calibrate</span>
+    <span class="kc opt"><kbd>C</kbd>recentre</span>
+    <span class="kc opt"><kbd>D</kbd>debug</span>
+    <span class="kc"><kbd>V</kbd>self-test</span>
+  </div>
+
+  <div id="start">
+    <div class="card glass">
+      <div id="brand">
+        <div class="mark"><span class="logo"></span><span class="name">Air <b>Ukulele</b></span></div>
+        <div class="tag">webcam · physically modelled · Claude Build Day</div>
+      </div>
+      <p>Play a ukulele in the air. Your left hand makes the chord shape, your right index finger strums the strings on screen. Every note is synthesised from a physical string model and checked against real ukulele pitch.</p>
+      <button id="startBtn">Start — camera + sound</button>
+      <div class="hint"><span>Nothing is recorded or uploaded</span><span>Keyboard works without a camera</span></div>
+      <p id="startNote"></p>
+    </div>
+  </div>
+
+  <div id="panel"><div class="sheet glass"><span class="close">press V or Esc to close</span><div id="panelBody"></div></div></div>
+  <pre id="out" hidden></pre>
+</div>
+<script type="module">
+
+// ==========================================================================
+// SECTION tuning/  (src/tuning.js)
+// ==========================================================================
+// ============================================================================
+// tuning/  — ground truth for a standard re-entrant ukulele (gCEA), A4 = 440 Hz
+// Pure functions, no DOM, no audio. Safe to load in node for tests.
+// String index 0..3 = G C E A  (0 = top string nearest the player's face)
+// ============================================================================
+const Tuning = (() => {
+  const A4 = 440; // ISO 16 concert pitch
+
+  // Semitone offsets from A4 for the open strings: G4 = -2, C4 = -9, E4 = -5, A4 = 0
+  const OPEN_SEMITONES = [-2, -9, -5, 0];
+  const OPEN_NAMES = ['G4', 'C4', 'E4', 'A4'];
+  // Equal temperament: f = 440 · 2^(n/12). Not rounded — this is the spec.
+  const OPEN_HZ = OPEN_SEMITONES.map(n => A4 * Math.pow(2, n / 12));
+
+  // Fret tables in G C E A order. 'mute' damps all strings (handled by the engine).
+  const CHORDS = {
+    C:    [0, 0, 0, 3],
+    G:    [0, 2, 3, 2],
+    Am:   [2, 0, 0, 0],
+    F:    [2, 0, 1, 0],
+    open: [0, 0, 0, 0],
+    mute: [0, 0, 0, 0],
+  };
+  const CHORD_ORDER = ['C', 'G', 'Am', 'F'];     // the four demo chords
+  const RECOGNISED = ['C', 'G', 'Am', 'F', 'open', 'mute'];
+
+  const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+  // Real ukulele fingering for the annotations: s = string index (0 G … 3 A), f = fret, finger 1 index … 4 pinky
+  const FINGERING = {
+    C:    [{ s: 3, f: 3, finger: 3 }],
+    G:    [{ s: 1, f: 2, finger: 1 }, { s: 3, f: 2, finger: 2 }, { s: 2, f: 3, finger: 3 }],
+    Am:   [{ s: 0, f: 2, finger: 2 }],
+    F:    [{ s: 2, f: 1, finger: 1 }, { s: 0, f: 2, finger: 2 }],
+    open: [],
+    mute: [],
+  };
+  // Which fingers the recogniser wants curled (mirrors Chord rules) — for the hand glyph and help text
+  const CURL_RULE = {
+    C:    { fingers: ['ring'],                     text: 'curl the ring finger' },
+    G:    { fingers: ['index', 'middle', 'ring'],  text: 'curl index, middle and ring' },
+    Am:   { fingers: ['middle'],                   text: 'curl the middle finger' },
+    F:    { fingers: ['index', 'middle'],          text: 'curl index and middle' },
+    open: { fingers: [],                           text: 'open hand, all fingers straight' },
+    mute: { fingers: ['index', 'middle', 'ring', 'pinky'], text: 'make a fist' },
+  };
+
+  function fretHz(stringIdx, fret) {
+    return OPEN_HZ[stringIdx] * Math.pow(2, fret / 12);
+  }
+  function chordHz(name) {
+    const frets = CHORDS[name];
+    if (!frets) throw new Error('unknown chord ' + name);
+    return frets.map((f, i) => fretHz(i, f));
+  }
+  // Nearest equal-tempered note name, e.g. 523.25 → 'C5'
+  function noteName(hz) {
+    const n = Math.round(12 * Math.log2(hz / A4)) + 57; // 57 = MIDI 69 (A4) − 12
+    const octave = Math.floor(n / 12);
+    return NOTE_NAMES[n % 12] + octave;
+  }
+  function chordNotes(name) {
+    return chordHz(name).map(noteName);
+  }
+  function cents(measuredHz, targetHz) {
+    return 1200 * Math.log2(measuredHz / targetHz);
+  }
+
+  // Ground truth for V1 — copied from CLAUDE.md, compared within 0.01 Hz.
+  const GROUND_TRUTH = {
+    open: { notes: ['G4', 'C4', 'E4', 'A4'], hz: [391.995, 261.626, 329.628, 440.000] },
+    C:    { notes: ['G4', 'C4', 'E4', 'C5'], hz: [391.995, 261.626, 329.628, 523.251] },
+    G:    { notes: ['G4', 'D4', 'G4', 'B4'], hz: [391.995, 293.665, 391.995, 493.883] },
+    Am:   { notes: ['A4', 'C4', 'E4', 'A4'], hz: [440.000, 261.626, 329.628, 440.000] },
+    F:    { notes: ['A4', 'C4', 'F4', 'A4'], hz: [440.000, 261.626, 349.228, 440.000] },
+  };
+
+  // V1: returns { pass, lines[] }
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    for (const name of Object.keys(GROUND_TRUTH)) {
+      const gt = GROUND_TRUTH[name];
+      const hz = chordHz(name);
+      const notes = chordNotes(name);
+      for (let i = 0; i < 4; i++) {
+        const okHz = Math.abs(hz[i] - gt.hz[i]) <= 0.01;
+        const okNote = notes[i] === gt.notes[i];
+        if (!okHz || !okNote) pass = false;
+        lines.push(`${(okHz && okNote) ? 'PASS' : 'FAIL'} ${name.padEnd(4)} string ${i} ` +
+          `${notes[i].padEnd(3)} ${hz[i].toFixed(3)} Hz  (expected ${gt.notes[i]} ${gt.hz[i].toFixed(3)})`);
+      }
+    }
+    lines.unshift(pass ? 'V1 TUNING TABLE OK' : 'V1 TUNING TABLE FAILED');
+    return { pass, lines };
+  }
+
+  return { A4, OPEN_HZ, OPEN_NAMES, CHORDS, CHORD_ORDER, RECOGNISED, FINGERING, CURL_RULE,
+           fretHz, chordHz, chordNotes, noteName, cents, GROUND_TRUTH, selfTest };
+})();
+
+// node self-test:  node -e "eval(require('fs').readFileSync('src/tuning.js','utf8')); console.log(Tuning.selfTest().lines.join('\n'))"
+
+
+// ==========================================================================
+// SECTION audio/  (src/audio.js)
+// ==========================================================================
+// ============================================================================
+// AUDIO_WORKLET_SRC — runs on the audio thread. 4 Karplus-Strong strings + body.
+// Kept free of backticks and ${} so it can live inside a template string.
+// ============================================================================
+const AUDIO_WORKLET_SRC = `
+// ---------------------------------------------------------------------------
+// StringVoice: Karplus-Strong string with a fractional delay line.
+// ---------------------------------------------------------------------------
+class StringVoice {
+  constructor(fs) {
+    this.fs = fs;
+    this.L = 4096;                    // ring buffer; longest delay we need is C4 at 48 kHz (~183 samples), headroom for 96 kHz too
+    this.buf = new Float32Array(this.L);
+    this.w = 0;                       // write index
+    this.delay = 100;                 // fractional delay N (samples). N = fs/f0 - 0.5
+    this.rho = 0.993;                 // loop gain per period. 0.993 -> nylon uke rings ~1-2 s; 0.9 = palm mute
+    this.hz = 0;
+    this.burstLeft = 0;               // remaining excitation samples
+    this.burstAmp = 0;
+    this.lp = 0;                      // one-pole lowpass state for the excitation
+    // 6 kHz cutoff: a fingertip cannot excite the string much above this; removes fizz
+    this.lpA = 1 - Math.exp(-2 * Math.PI * 6000 / fs);
+  }
+  setFreq(hz) {
+    this.hz = hz;
+    // -0.5: the two-point averaging loop filter adds exactly half a sample of delay,
+    // so the total loop length N + 0.5 must equal fs/f0 for the pitch to be right.
+    this.delay = this.fs / hz - 0.5;
+  }
+  pluck(velocity) {
+    this.burstLeft = Math.round(this.delay);   // classic KS: excitation length = one period
+    this.burstAmp = 0.6 * velocity;            // 0.6 keeps a 4-string strum under the limiter knee
+    this.lp = 0;
+    // Deterministic noise per pluck (xorshift32): same pluck → same waveform, so V2 is reproducible
+    // and no random burst can hand the octave to the 2nd harmonic in one run and not the next.
+    this.pluckCount = (this.pluckCount || 0) + 1;
+    this.rng = (0x9E3779B9 ^ (Math.round(this.delay) * 2654435761) ^ (this.pluckCount * 40503)) >>> 0 || 1;
+  }
+  noise() {
+    let x = this.rng; x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    this.rng = x;
+    return x / 2147483648 - 1;                 // uniform in [-1, 1)
+  }
+  tick() {
+    const b = this.buf, L = this.L, w = this.w;
+    const D = this.delay, iD = Math.floor(D), fD = D - iD;
+    // Linear-interpolated fractional delay: x[n-D] between x[n-iD] and x[n-iD-1].
+    // Linear interpolation has phase delay == fD at low frequencies, so tuning is exact
+    // to well under a cent for fundamentals below fs/20.
+    const i0 = (w - iD + L) % L;
+    const i1 = (i0 - 1 + L) % L;
+    const i2 = (i1 - 1 + L) % L;
+    const xD  = (1 - fD) * b[i0] + fD * b[i1];   // x[n-D]
+    const xD1 = (1 - fD) * b[i1] + fD * b[i2];   // x[n-D-1]
+    // Loop filter: rho * 0.5 * (x[n-D] + x[n-D-1]) — lowpass so high harmonics decay faster (like a real string)
+    let y = this.rho * 0.5 * (xD + xD1);
+    if (this.burstLeft > 0) {
+      const n = this.noise();
+      this.lp += this.lpA * (n - this.lp);
+      y += this.burstAmp * this.lp;
+      this.burstLeft--;
+    }
+    b[w] = y;
+    this.w = (w + 1) % L;
+    return y;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Biquad peaking EQ (RBJ cookbook). Used for body resonances.
+// ---------------------------------------------------------------------------
+class Peak {
+  constructor(fs, f0, Q, dB) {
+    const A = Math.pow(10, dB / 40);
+    const w0 = 2 * Math.PI * f0 / fs;
+    const alpha = Math.sin(w0) / (2 * Q);
+    const cw = Math.cos(w0);
+    const a0 = 1 + alpha / A;
+    this.b0 = (1 + alpha * A) / a0;
+    this.b1 = (-2 * cw) / a0;
+    this.b2 = (1 - alpha * A) / a0;
+    this.a1 = (-2 * cw) / a0;
+    this.a2 = (1 - alpha / A) / a0;
+    this.x1 = 0; this.x2 = 0; this.y1 = 0; this.y2 = 0;
+  }
+  tick(x) {
+    const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+    this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
+    return y;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UkeProcessor: 4 strings -> DC blocker -> body EQ -> tanh limiter
+// ---------------------------------------------------------------------------
+class UkeProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    // Defaults = gCEA equal temperament from A4 = 440; overwritten by setTuning
+    this.openHz = [391.995, 261.626, 329.628, 440.0];
+    this.frets = [0, 0, 0, 0];
+    this.mute = false;
+    this.rho = 0.993;                 // normal ring
+    this.rhoMute = 0.9;               // palm mute: dies in ~50 periods (~0.1 s)
+    this.strings = [0, 1, 2, 3].map(() => new StringVoice(sampleRate));
+    this.queue = [];                  // pending plucks {when, string, velocity}
+    // Body: ~300 Hz Helmholtz air resonance of a soprano uke body (Q3, +5 dB),
+    // ~700 Hz first top-plate mode (Q2.5, +3 dB).
+    this.body1 = new Peak(sampleRate, 300, 3.0, 5);
+    this.body2 = new Peak(sampleRate, 700, 2.5, 3);
+    this.dcX = 0; this.dcY = 0;       // DC blocker state (noise bursts have a small mean; loop passes DC)
+    this.master = 1.0;
+    // processorOptions arrive synchronously with construction. Port messages do NOT: in an
+    // OfflineAudioContext the render thread runs flat out and messages posted before
+    // startRendering() are only dispatched after rendering ends. So offline tests (V2) and the
+    // initial tuning use processorOptions; live play uses messages.
+    const po = (options && options.processorOptions) || {};
+    if (Array.isArray(po.openHz) && po.openHz.length === 4) this.openHz = po.openHz.slice();
+    if (Array.isArray(po.frets) && po.frets.length === 4) this.frets = po.frets.slice();
+    if (typeof po.mute === 'boolean') this.mute = po.mute;
+    if (Array.isArray(po.plucks)) for (const p of po.plucks) this.onMessage(Object.assign({ type: 'pluck' }, p));
+    this.port.onmessage = (e) => this.onMessage(e.data);
+  }
+  onMessage(m) {
+    switch (m.type) {
+      case 'pluck':
+        this.queue.push({ when: (typeof m.when === 'number') ? m.when : 0,
+                          string: m.string | 0,
+                          velocity: Math.min(1, Math.max(0, +m.velocity || 0)) });
+        break;
+      case 'setChord':
+        if (Array.isArray(m.frets) && m.frets.length === 4) this.frets = m.frets.slice();
+        break;
+      case 'setMute':
+        this.mute = !!m.mute;
+        break;
+      case 'setTuning':
+        if (Array.isArray(m.openHz) && m.openHz.length === 4) this.openHz = m.openHz.slice();
+        break;
+      case 'setParams':
+        if (typeof m.rho === 'number') this.rho = m.rho;
+        if (typeof m.rhoMute === 'number') this.rhoMute = m.rhoMute;
+        if (typeof m.master === 'number') this.master = m.master;
+        break;
+    }
+  }
+  fire(p) {
+    const s = this.strings[p.string];
+    if (!s) return;
+    // Retune THIS string to the current chord at pluck time. Other ringing strings keep pitch.
+    const hz = this.openHz[p.string] * Math.pow(2, this.frets[p.string] / 12);
+    s.setFreq(hz);
+    s.rho = this.mute ? this.rhoMute : this.rho;
+    s.pluck(p.velocity);
+    this.port.postMessage({ type: 'plucked', string: p.string, hz: hz, when: currentTime });
+  }
+  process(inputs, outputs) {
+    const out = outputs[0][0];
+    const n = out.length;
+    const t0 = currentTime;
+    const blockEnd = t0 + n / sampleRate;
+    // Pull every pluck due in this block and place it at its sample offset (sub-block accuracy keeps the rake).
+    let due = null;
+    for (let k = this.queue.length - 1; k >= 0; k--) {
+      const p = this.queue[k];
+      if (p.when < blockEnd) {
+        let off = Math.round((p.when - t0) * sampleRate);
+        if (off < 0) off = 0;
+        if (off > n - 1) off = n - 1;
+        (due || (due = [])).push({ off: off, p: p });
+        this.queue.splice(k, 1);
+      }
+    }
+    if (due) due.sort((a, b) => a.off - b.off);
+    let di = 0;
+    const S = this.strings;
+    for (let i = 0; i < n; i++) {
+      if (due) while (di < due.length && due[di].off === i) { this.fire(due[di].p); di++; }
+      const s = S[0].tick() + S[1].tick() + S[2].tick() + S[3].tick();
+      // DC blocker: y = x - x1 + 0.995 y1 (corner ~40 Hz at 48 kHz)
+      const dc = s - this.dcX + 0.995 * this.dcY;
+      this.dcX = s; this.dcY = dc;
+      let y = this.body2.tick(this.body1.tick(dc));
+      out[i] = Math.tanh(y * this.master);   // soft limiter: 4 hard strums never clip the speakers
+    }
+    return true;
+  }
+}
+registerProcessor('uke-processor', UkeProcessor);
+`;
+
+// ============================================================================
+// audio/ — main-thread wrapper, pitch measurement (pure), V2 self-test.
+// Depends on: Tuning (src/tuning.js, concatenated before this file).
+// ============================================================================
+const AudioEngine = (() => {
+  let ctx = null, node = null, analyser = null;
+  let lastPluck = null;             // {string, hz} of the most recent pluck the worklet fired
+  let currentChord = 'open';
+  let workletUrl = null;
+  let liveBuf = null;
+
+  // data: URL, not a Blob URL: on file:// the page origin is "null" and Chrome rejects
+  // blob:null/... worklet modules as cross-origin. data: URLs pass the CORS check everywhere.
+  function moduleUrl() {
+    if (!workletUrl) workletUrl = 'data:application/javascript;charset=utf-8,' + encodeURIComponent(AUDIO_WORKLET_SRC);
+    return workletUrl;
+  }
+
+  // Creates a fresh worklet node on any context (online or offline). Does not touch module state.
+  // `initial` = { frets, mute, plucks:[{string, velocity, when}] } is delivered via processorOptions
+  // so it is guaranteed to be in place before the first render quantum (see note in the worklet).
+  async function makeNode(c, initial) {
+    await c.audioWorklet.addModule(moduleUrl());
+    const processorOptions = Object.assign({ openHz: Array.from(Tuning.OPEN_HZ) }, initial || {});
+    return new AudioWorkletNode(c, 'uke-processor', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1], processorOptions,
+    });
+  }
+
+  async function init(existingCtx) {
+    ctx = existingCtx || new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    if (ctx.state === 'suspended' && ctx.resume) { try { await ctx.resume(); } catch (e) { /* needs user gesture; caller handles */ } }
+    node = await makeNode(ctx);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 8192;          // 8192 @ 48 kHz = 171 ms window: ~1 cent resolution after interpolation
+    analyser.smoothingTimeConstant = 0;
+    node.connect(analyser);
+    analyser.connect(ctx.destination);
+    liveBuf = new Float32Array(analyser.fftSize);
+    node.port.onmessage = (e) => {
+      if (e.data && e.data.type === 'plucked') lastPluck = { string: e.data.string, hz: e.data.hz };
+    };
+    setChord('open');
+    return { ctx, node, analyser };
+  }
+
+  function now() { return ctx ? ctx.currentTime : 0; }
+
+  function pluck(string, velocity, when) {
+    if (!node) return;
+    node.port.postMessage({ type: 'pluck', string, velocity: (velocity == null ? 0.8 : velocity), when: (when == null ? 0 : when) });
+  }
+  function setFrets(frets) {
+    if (!node) return;
+    node.port.postMessage({ type: 'setChord', frets: Array.from(frets) });
+  }
+  function setMute(m) {
+    if (!node) return;
+    node.port.postMessage({ type: 'setMute', mute: !!m });
+  }
+  function setChord(name) {
+    const frets = Tuning.CHORDS[name];
+    if (!frets) throw new Error('unknown chord ' + name);
+    currentChord = name;
+    setMute(name === 'mute');
+    setFrets(frets);
+  }
+  function setParams(p) { if (node) node.port.postMessage(Object.assign({ type: 'setParams' }, p)); }
+  function chord() { return currentChord; }
+
+  // ---------------------------------------------------------------------------
+  // FFT (radix-2, in place). Small and dependency-free.
+  // ---------------------------------------------------------------------------
+  function fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {           // bit reversal
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len;
+      const wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < (len >> 1); k++) {
+          const a = i + k, b = a + (len >> 1);
+          const tr = re[b] * cr - im[b] * ci;
+          const ti = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - tr; im[b] = im[a] - ti;
+          re[a] += tr;        im[a] += ti;
+          const ncr = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr; cr = ncr;
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // measurePitch — PURE. Hann window, 4x zero-padded FFT, parabolic peak interpolation,
+  // subharmonic correction (so a loud 2nd harmonic cannot masquerade as f0),
+  // harmonic presence at 2f, 3f within +-1%.
+  // ---------------------------------------------------------------------------
+  function measurePitch(samples, sampleRate, opts) {
+    const fmin = (opts && opts.fmin) || 150;
+    const fmax = (opts && opts.fmax) || 1200;
+    const len = samples.length;
+    let npad = 1; while (npad < len * 4) npad <<= 1;
+    if (npad > 262144) npad = 262144;
+    const re = new Float32Array(npad), im = new Float32Array(npad);
+    let sumW = 0;
+    for (let i = 0; i < len; i++) {
+      const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (len - 1));   // Hann
+      re[i] = samples[i] * w; sumW += w;
+    }
+    fft(re, im);
+    const half = npad >> 1;
+    const mag = new Float32Array(half);
+    for (let k = 0; k < half; k++) mag[k] = Math.hypot(re[k], im[k]);
+    const binHz = sampleRate / npad;
+    const toDb = (m) => 20 * Math.log10((2 * m / sumW) + 1e-12);   // full-scale sine ≈ 0 dBFS
+    const kmin = Math.max(2, Math.floor(fmin / binHz)), kmax = Math.min(half - 2, Math.ceil(fmax / binHz));
+
+    // local max within +-frac of centre frequency
+    function localMax(fc, frac) {
+      const a = Math.max(2, Math.floor(fc * (1 - frac) / binHz)), b = Math.min(half - 2, Math.ceil(fc * (1 + frac) / binHz));
+      let bk = -1, bm = -1;
+      for (let k = a; k <= b; k++) if (mag[k] > bm) { bm = mag[k]; bk = k; }
+      return { k: bk, mag: bm };
+    }
+    function interp(k) {
+      const a = Math.log(mag[k - 1] + 1e-20), b = Math.log(mag[k] + 1e-20), c = Math.log(mag[k + 1] + 1e-20);
+      const den = a - 2 * b + c;
+      const p = den !== 0 ? 0.5 * (a - c) / den : 0;
+      return (k + p) * binHz;
+    }
+
+    let bk = kmin, bm = -1;
+    for (let k = kmin; k <= kmax; k++) if (mag[k] > bm) { bm = mag[k]; bk = k; }
+    let peakDb = toDb(bm);
+    let k0 = bk;
+    // Octave-robust fundamental: candidates are the loudest peak and its sub-multiples f/2, f/3
+    // (if a real peak exists there within 30 dB). Score each candidate by the energy of its first
+    // five harmonics. The true f0's series contains every peak in the signal (including the loud
+    // 2nd harmonic), while the octave candidate misses the odd harmonics, so f0 always scores higher.
+    let bestScore = -Infinity;
+    for (const div of [1, 2, 3]) {
+      const fc = bk * binHz / div;
+      if (fc < fmin) continue;
+      const lm = div === 1 ? { k: bk, mag: bm } : localMax(fc, 0.03);
+      if (lm.k <= 0 || toDb(lm.mag) < peakDb - 30) continue;
+      const f = interp(lm.k);
+      let score = 0;
+      for (let h = 1; h <= 5; h++) {
+        if (h * f >= sampleRate / 2) break;
+        const hm = localMax(h * f, 0.015);
+        if (hm.k > 0) score += Math.max(0, toDb(hm.mag) + 60);   // floor at -60 dBFS
+      }
+      if (score > bestScore + 1e-9) { bestScore = score; k0 = lm.k; }
+    }
+    const hz = interp(k0);
+    const fundDb = toDb(mag[k0]);
+    const harmonics = [];
+    for (const n of [2, 3]) {
+      const lm = localMax(n * hz, 0.01);
+      const present = lm.k > 0 && (n * hz < sampleRate / 2) && toDb(lm.mag) > fundDb - 40;
+      harmonics.push({ n, hz: lm.k > 0 ? interp(lm.k) : 0, present });
+    }
+    return { hz, peakDb: fundDb, harmonics };
+  }
+
+  // Live readout for the HUD (V5). Same measurement code as V2.
+  function liveReadout() {
+    if (!analyser || !liveBuf) return null;
+    analyser.getFloatTimeDomainData(liveBuf);
+    const r = measurePitch(liveBuf, ctx.sampleRate, { fmin: 150, fmax: 1200 });
+    if (r.peakDb < -50) return null;                      // silence
+    const targetHz = lastPluck ? lastPluck.hz : null;
+    return {
+      measuredHz: r.hz,
+      targetHz,
+      cents: targetHz ? Tuning.cents(r.hz, targetHz) : null,
+      note: Tuning.noteName(r.hz),
+      string: lastPluck ? lastPluck.string : null,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // V2 — render each note alone offline and measure it.
+  // ---------------------------------------------------------------------------
+  async function renderOne(frets, string, velocity, sr, seconds) {
+    const oc = new OfflineAudioContext(1, Math.round(sr * seconds), sr);
+    const nd = await makeNode(oc, { frets: Array.from(frets), mute: false, plucks: [{ string, velocity, when: 0.01 }] });
+    nd.connect(oc.destination);
+    const buf = await oc.startRendering();
+    return buf.getChannelData(0);
+  }
+  function rms(x, a, b) { let s = 0; for (let i = a; i < b; i++) s += x[i] * x[i]; return Math.sqrt(s / Math.max(1, b - a)); }
+
+  async function selfTestV2() {
+    const sr = 48000;
+    const cases = [];
+    for (let s = 0; s < 4; s++) cases.push({ label: 'open', frets: Tuning.CHORDS.open, string: s });
+    for (const c of Tuning.CHORD_ORDER) for (let s = 0; s < 4; s++) cases.push({ label: c, frets: Tuning.CHORDS[c], string: s });
+    const lines = [];
+    let pass = true;
+    for (const cs of cases) {
+      const x = await renderOne(cs.frets, cs.string, 0.8, sr, 1.0);
+      const target = Tuning.fretHz(cs.string, cs.frets[cs.string]);
+      const seg = x.subarray(Math.round(0.15 * sr), Math.round(0.65 * sr));
+      const m = measurePitch(seg, sr, { fmin: 150, fmax: 1200 });
+      const cents = Tuning.cents(m.hz, target);
+      const harmOk = m.harmonics.every(h => h.present);
+      const early = rms(x, Math.round(0.05 * sr), Math.round(0.15 * sr));
+      const late = rms(x, Math.round(0.75 * sr), Math.round(0.85 * sr));
+      const decayOk = late < early && early > 1e-4;
+      const ok = Math.abs(cents) <= 3 && harmOk && decayOk;
+      if (!ok) pass = false;
+      lines.push(
+        (ok ? 'PASS' : 'FAIL') + ' ' + cs.label.padEnd(4) + ' s' + cs.string + ' ' + Tuning.noteName(target).padEnd(3) +
+        ' target ' + target.toFixed(3).padStart(8) + ' Hz  measured ' + m.hz.toFixed(3).padStart(8) + ' Hz  ' +
+        (cents >= 0 ? '+' : '') + cents.toFixed(2).padStart(5) + ' c  harmonics ' +
+        m.harmonics.map(h => (h.present ? '2f 3f'.split(' ')[h.n - 2] : '--')).join(' ') +
+        '  decay ' + (decayOk ? 'ok' : 'NO') + ' (' + early.toFixed(3) + '->' + late.toFixed(3) + ')'
+      );
+    }
+    lines.unshift(pass ? 'V2 PITCH OK' : 'V2 PITCH FAILED');
+    return { pass, lines };
+  }
+
+  return { init, now, pluck, setChord, setFrets, setMute, setParams, chord,
+           measurePitch, liveReadout, selfTestV2, makeNode,
+           get ctx() { return ctx; }, get node() { return node; }, get analyser() { return analyser; },
+           get lastPluck() { return lastPluck; } };
+})();
+
+
+// ==========================================================================
+// SECTION tracking/  (src/tracking.js)
+// ==========================================================================
+// ============================================================================
+// tracking/  — MediaPipe HandLandmarker wrapper. Two hands, roles by screen side.
+//
+// Coordinate convention handed to the rest of the app:
+//   landmarks[i] = { x, y, z } with x, y normalised to [0, 1] of the video frame,
+//   x ALREADY MIRRORED (x' = 1 − x) so it lines up with the mirrored <video>
+//   (CSS transform: scaleX(-1)). y grows downward. z is MediaPipe's relative
+//   depth (wrist ≈ 0, negative = toward camera), left unchanged.
+//   Multiply by canvas width/height to draw.
+//
+// Roles are assigned by screen side AFTER mirroring, never by MediaPipe
+// handedness (it flips under mirroring): smaller wrist x = fretting (left
+// side of the screen), larger = strumming. setSwap(true) inverts for lefties.
+//
+// Loading: Chrome refuses import() of local .mjs and fetch() of local wasm from
+// file:// (origin null). So over http(s) we try ./vendor first then the CDN;
+// over file:// we go straight to the CDN.
+// ============================================================================
+const Tracking = (() => {
+  const MP_VERSION = '0.10.14';
+  const CDN_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+  const CDN_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+  // Standard MediaPipe hand topology (21 points). Kept here so the integrator
+  // never needs to know it.
+  const CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],          // thumb
+    [0, 5], [5, 6], [6, 7], [7, 8],          // index
+    [5, 9], [9, 10], [10, 11], [11, 12],     // middle
+    [9, 13], [13, 14], [14, 15], [15, 16],   // ring
+    [13, 17], [17, 18], [18, 19], [19, 20],  // pinky
+    [0, 17],                                 // palm base
+  ];
+
+  let landmarker = null;
+  let source = null;        // 'vendor' | 'cdn'
+  let delegate = null;      // 'GPU' | 'CPU'
+  let swap = false;
+
+  // per-frame guard + fps EMA
+  let lastVideoTime = -1;
+  let lastResult = { fretting: null, strumming: null, fps: 0 };
+  let lastDetectMs = 0;
+  let fps = 0;
+  const FPS_ALPHA = 0.1;   // EMA smoothing; ~10-frame memory
+
+  function resolveBaseDir() {
+    // Directory of the page (uke.html sits at the project root; the test page
+    // sits in src/, so allow an override via Tracking.vendorPath).
+    return Tracking.vendorPath || './vendor';
+  }
+
+  function candidateSources() {
+    const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
+    const vendorBase = resolveBaseDir();
+    const vendor = {
+      name: 'vendor',
+      bundle: `${vendorBase}/vision_bundle.mjs`,
+      wasm: `${vendorBase}/wasm`,
+      model: `${vendorBase}/hand_landmarker.task`,
+    };
+    const cdn = {
+      name: 'cdn',
+      bundle: `${CDN_BASE}/vision_bundle.mjs`,
+      wasm: `${CDN_BASE}/wasm`,
+      model: CDN_MODEL,
+    };
+    return isHttp ? [vendor, cdn] : [cdn];
+  }
+
+  // Resolve a possibly-relative URL against the page so import() and the wasm
+  // loader agree on where things live.
+  function abs(url) {
+    try { return new URL(url, location.href).href; } catch (_) { return url; }
+  }
+
+  async function createLandmarker(vision, HandLandmarker, modelAssetPath, wantDelegate) {
+    return HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath, delegate: wantDelegate },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      // Raised from the 0.5 defaults: in VIDEO mode a hand leaving the frame lingers on its old
+      // ROI with a jittery skeleton until tracking confidence fails, and that ghost sat exactly
+      // where the strings are. Real hands at arm's length score > 0.9.
+      minHandDetectionConfidence: 0.7,
+      minHandPresenceConfidence: 0.7,
+      minTrackingConfidence: 0.6,
+    });
+  }
+
+  async function init({ onStatus } = {}) {
+    const status = (m) => { if (onStatus) onStatus(m); };
+    const errors = [];
+    for (const src of candidateSources()) {
+      try {
+        status(`loading MediaPipe from ${src.name}…`);
+        const mod = await import(abs(src.bundle));
+        const { FilesetResolver, HandLandmarker } = mod;
+        const vision = await FilesetResolver.forVisionTasks(abs(src.wasm));
+        const model = abs(src.model);
+        try {
+          landmarker = await createLandmarker(vision, HandLandmarker, model, 'GPU');
+          delegate = 'GPU';
+        } catch (gpuErr) {
+          status(`GPU delegate failed (${gpuErr && gpuErr.message}); trying CPU`);
+          landmarker = await createLandmarker(vision, HandLandmarker, model, 'CPU');
+          delegate = 'CPU';
+        }
+        source = src.name;
+        Tracking.source = source;
+        Tracking.delegate = delegate;
+        status(`MediaPipe ready (${source}, ${delegate})`);
+        return { source, delegate };
+      } catch (e) {
+        errors.push(`${src.name}: ${e && e.message ? e.message : e}`);
+        status(`MediaPipe ${src.name} failed: ${e && e.message ? e.message : e}`);
+      }
+    }
+    throw new Error('MediaPipe failed to load. ' + errors.join(' | '));
+  }
+
+  async function startCamera(videoEl, { width = 640, height = 480 } = {}) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: width }, height: { ideal: height }, facingMode: 'user' },
+      audio: false,
+    });
+    videoEl.srcObject = stream;
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+    await new Promise((resolve) => {
+      if (videoEl.readyState >= 1) return resolve();
+      videoEl.onloadedmetadata = () => resolve();
+    });
+    await videoEl.play();
+    return { width: videoEl.videoWidth, height: videoEl.videoHeight, stream };
+  }
+
+  function toHand(rawLandmarks, handednessEntry) {
+    const landmarks = rawLandmarks.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z })); // mirror x
+    const cat = handednessEntry && handednessEntry[0];
+    return {
+      landmarks,
+      handedness: cat ? cat.categoryName : 'Unknown',   // raw MediaPipe label, informational
+      score: cat ? cat.score : 0,
+    };
+  }
+
+  // Plausibility filters before roles are assigned. All in mirrored normalised coords.
+  const MIN_HANDEDNESS_SCORE = 0.6; // ambiguous left/right is a good proxy for a bad detection (face, sleeve, ghost)
+  const DUP_WRIST_DIST = 0.08;      // two "hands" with wrists this close are one hand detected twice
+  const EDGE_MARGIN = 0.03;         // a wrist this close to the frame border is a hand leaving the frame
+  const ROLE_HI = 0.55, ROLE_LO = 0.45; // single-hand role hysteresis around the x = 0.5 midline
+  let lastSingleRole = null;        // 'fretting' | 'strumming' — what the lone hand was last frame
+
+  function plausibleHands(hands) {
+    const out = [];
+    for (const h of hands) {
+      if (h.score < MIN_HANDEDNESS_SCORE) continue;
+      const w = h.landmarks[0];
+      if (w.x < EDGE_MARGIN || w.x > 1 - EDGE_MARGIN || w.y < EDGE_MARGIN || w.y > 1 - EDGE_MARGIN) continue;
+      const dup = out.findIndex(o => Math.hypot(o.landmarks[0].x - w.x, o.landmarks[0].y - w.y) < DUP_WRIST_DIST);
+      if (dup >= 0) { if (h.score > out[dup].score) out[dup] = h; continue; }
+      out.push(h);
+    }
+    return out;
+  }
+
+  // Assign roles by mirrored wrist x. Returns { fretting, strumming }.
+  // With one hand, the role only changes when the wrist is clearly past the midline, so a
+  // hand hovering near x = 0.5 cannot flip roles frame to frame (which would teleport the
+  // "strumming tip" and rake every string between the two positions).
+  function assignRoles(rawHands) {
+    const hands = plausibleHands(rawHands);
+    let fretting = null, strumming = null;
+    if (hands.length >= 2) {
+      const [a, b] = hands;
+      const aLeft = a.landmarks[0].x < b.landmarks[0].x;
+      fretting = aLeft ? a : b;
+      strumming = aLeft ? b : a;
+      lastSingleRole = null;
+    } else if (hands.length === 1) {
+      const h = hands[0], x = h.landmarks[0].x;
+      let role = lastSingleRole;
+      if (x > ROLE_HI) role = 'strumming';
+      else if (x < ROLE_LO) role = 'fretting';
+      else if (!role) role = x < 0.5 ? 'fretting' : 'strumming';
+      lastSingleRole = role;
+      if (role === 'fretting') fretting = h; else strumming = h;
+    } else {
+      lastSingleRole = null;
+    }
+    if (swap) return { fretting: strumming, strumming: fretting };
+    return { fretting, strumming };
+  }
+
+  function detect(videoEl, nowMs) {
+    if (!landmarker) return lastResult;
+    if (videoEl.readyState < 2) return lastResult;
+    // Only run inference once per new video frame.
+    if (videoEl.currentTime === lastVideoTime) return lastResult;
+    lastVideoTime = videoEl.currentTime;
+
+    const t = (typeof nowMs === 'number') ? nowMs : performance.now();
+    const res = landmarker.detectForVideo(videoEl, t);
+
+    if (lastDetectMs > 0) {
+      const inst = 1000 / Math.max(1, t - lastDetectMs);
+      fps = fps === 0 ? inst : fps + FPS_ALPHA * (inst - fps);
+    }
+    lastDetectMs = t;
+
+    const handednessList = res.handednesses || res.handedness || [];
+    const hands = (res.landmarks || []).map((lm, i) => toHand(lm, handednessList[i]));
+    const roles = assignRoles(hands);
+    lastResult = { fretting: roles.fretting, strumming: roles.strumming, fps };
+    return lastResult;
+  }
+
+  // Drive detect() from the video's own frame clock. cb(result, nowMs).
+  function onFrame(videoEl, cb) {
+    let stopped = false;
+    const useRVFC = typeof videoEl.requestVideoFrameCallback === 'function';
+    const tick = (now) => {
+      if (stopped) return;
+      const t = (typeof now === 'number') ? now : performance.now();
+      const result = detect(videoEl, t);
+      cb(result, t);
+      if (useRVFC) videoEl.requestVideoFrameCallback(tick);
+      else requestAnimationFrame(tick);
+    };
+    if (useRVFC) videoEl.requestVideoFrameCallback(tick);
+    else requestAnimationFrame(tick);
+    return () => { stopped = true; };
+  }
+
+  function drawLandmarks(ctx, hand, w, h, color = '#4cf') {
+    if (!hand) return;
+    const pts = hand.landmarks;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (const [a, b] of CONNECTIONS) {
+      ctx.moveTo(pts[a].x * w, pts[a].y * h);
+      ctx.lineTo(pts[b].x * w, pts[b].y * h);
+    }
+    ctx.stroke();
+    for (let i = 0; i < pts.length; i++) {
+      ctx.beginPath();
+      ctx.arc(pts[i].x * w, pts[i].y * h, i === 8 || i === 0 ? 6 : 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function setSwap(v) { swap = !!v; }
+  function getSwap() { return swap; }
+  function isReady() { return !!landmarker; }
+
+  return {
+    init, startCamera, detect, onFrame, drawLandmarks, assignRoles, plausibleHands,
+    setSwap, getSwap, isReady,
+    CONNECTIONS, MP_VERSION,
+    vendorPath: null,   // override e.g. '../vendor' when the page is not at project root
+    source: null,       // 'vendor' | 'cdn' after init
+    delegate: null,     // 'GPU' | 'CPU' after init
+  };
+})();
+
+
+// ==========================================================================
+// SECTION chord/  (src/chord.js)
+// ==========================================================================
+// ============================================================================
+// chord/  — recognise which ukulele chord the fretting hand is shaping
+// Pure functions. No DOM except localStorage inside calib.save/load (guarded).
+// Depends on the global `Tuning` (src/tuning.js) for the chord name list.
+//
+// Input: `landmarks` = 21 × {x,y,z}, MediaPipe hand topology, normalised image
+// coords (x may be mirrored, y grows downward). Everything here works in a
+// hand-normalised frame so screen position, scale, rotation and chirality
+// never reach the classifier.
+// ============================================================================
+const Chord = (() => {
+  // ---- landmark indices (MediaPipe) -----------------------------------------
+  const WRIST = 0;
+  const THUMB = [1, 2, 3, 4];             // CMC, MCP, IP, TIP
+  const FINGERS = {                       // MCP, PIP, DIP, TIP
+    index:  [5, 6, 7, 8],
+    middle: [9, 10, 11, 12],
+    ring:   [13, 14, 15, 16],
+    pinky:  [17, 18, 19, 20],
+  };
+  const FINGER_NAMES = ['index', 'middle', 'ring', 'pinky'];
+  const MIDDLE_MCP = 9;
+
+  // ---- tunable parameters (debug HUD may edit these live) -------------------
+  const params = {
+    // dist(tip,wrist)/dist(mcp,wrist): a straight finger reaches ~1.8–1.9× the
+    // MCP distance; a fully folded finger's tip sits at ~1.0× (level with the
+    // knuckle) or closer. curl maps that ratio linearly onto [0,1].
+    extRatio: 1.8,
+    curlRatio: 1.0,
+    // a finger counts as DOWN (fretting) above this curl
+    downThreshold: 0.35,
+    // per-dimension std floor for the calibrated classifier (normalised units)
+    stdFloor: 0.02,
+  };
+
+  // ---- small vector helpers -------------------------------------------------
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+  const clamp01 = v => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+  // ---- hand-normalised frame ------------------------------------------------
+  // 1. translate wrist → origin
+  // 2. rotate so wrist→middle-MCP points along +y
+  // 3. scale so that distance is 1
+  // 4. reflect x so the thumb is on the negative-x side (chirality/mirror-proof)
+  function normalize(lm) {
+    const w = lm[WRIST], m = lm[MIDDLE_MCP];
+    const dx = m.x - w.x, dy = m.y - w.y;
+    const len = Math.hypot(dx, dy) || 1e-9;
+    // rotation taking (dx,dy) → (0,len): angle from +y axis
+    const c = dy / len, s = dx / len;     // cos, sin of the rotation
+    const out = new Float32Array(63);
+    for (let i = 0; i < 21; i++) {
+      const px = lm[i].x - w.x, py = lm[i].y - w.y;
+      // rotate by -θ where θ = atan2(dx, dy): x' = px·c − py·s ; y' = px·s + py·c
+      out[i * 3]     = (px * c - py * s) / len;
+      out[i * 3 + 1] = (px * s + py * c) / len;
+      out[i * 3 + 2] = ((lm[i].z || 0) - (w.z || 0)) / len;
+    }
+    // chirality: mean thumb x must be negative
+    let tx = 0;
+    for (const t of THUMB) tx += out[t * 3];
+    if (tx > 0) for (let i = 0; i < 21; i++) out[i * 3] = -out[i * 3];
+    return out;
+  }
+
+  // ---- finger curl ----------------------------------------------------------
+  function curls(lm) {
+    const w = lm[WRIST];
+    const res = {};
+    for (const f of FINGER_NAMES) {
+      const [mcp, , , tip] = FINGERS[f];
+      const ratio = dist(lm[tip], w) / (dist(lm[mcp], w) || 1e-9);
+      res[f] = clamp01((params.extRatio - ratio) / (params.extRatio - params.curlRatio));
+    }
+    return res;
+  }
+
+  // ---- rule classifier ------------------------------------------------------
+  // down-finger pattern (index,middle,ring,pinky) → chord. Mirrors the real
+  // fretting fingers of each shape; players exaggerate on camera.
+  const RULES = [
+    { down: [0, 0, 0, 0], chord: 'open' },
+    { down: [0, 0, 1, 0], chord: 'C' },     // ring on A string, 3rd fret
+    { down: [0, 1, 0, 0], chord: 'Am' },    // middle on G string, 2nd fret
+    { down: [1, 1, 0, 0], chord: 'F' },     // index E/1, middle G/2
+    { down: [1, 1, 1, 0], chord: 'G' },     // index, middle, ring
+    { down: [1, 1, 1, 1], chord: 'mute' },
+  ];
+
+  function classifyRules(c) {
+    const thr = params.downThreshold;
+    const down = FINGER_NAMES.map(f => (c[f] > thr ? 1 : 0));
+    let conf = 1;
+    for (const f of FINGER_NAMES) conf = Math.min(conf, Math.abs(c[f] - thr) / thr);
+    conf = clamp01(conf);
+    for (const r of RULES) {
+      if (r.down.every((d, i) => d === down[i])) return { chord: r.chord, confidence: conf };
+    }
+    return { chord: null, confidence: 0 };
+  }
+
+  // ---- calibration store ----------------------------------------------------
+  const STORAGE_KEY = 'uke.calib.v1';
+
+  function stats(frames) {
+    const n = frames.length, d = 63;
+    const centroid = new Float64Array(d), std = new Float64Array(d);
+    for (const fr of frames) for (let i = 0; i < d; i++) centroid[i] += fr[i];
+    for (let i = 0; i < d; i++) centroid[i] /= n;
+    for (const fr of frames) for (let i = 0; i < d; i++) std[i] += (fr[i] - centroid[i]) ** 2;
+    for (let i = 0; i < d; i++) std[i] = Math.max(params.stdFloor, Math.sqrt(std[i] / Math.max(1, n - 1)));
+    return { centroid, std };
+  }
+
+  function stdDist(v, model) {
+    let s = 0;
+    for (let i = 0; i < 63; i++) { const t = (v[i] - model.centroid[i]) / model.std[i]; s += t * t; }
+    return Math.sqrt(s);
+  }
+
+  // nearest centroid over a {label: {centroid,std}} map
+  function nearest(v, models) {
+    let best = null, dBest = Infinity, dSecond = Infinity;
+    for (const label of Object.keys(models)) {
+      const d = stdDist(v, models[label]);
+      if (d < dBest) { dSecond = dBest; dBest = d; best = label; }
+      else if (d < dSecond) dSecond = d;
+    }
+    const confidence = isFinite(dSecond) && dSecond > 0 ? clamp01(1 - dBest / dSecond) : 0;
+    return { chord: best, confidence };
+  }
+
+  function createCalib() {
+    const data = {};          // label → { frames: number[][], centroid, std }
+    let capturing = null;     // { label, frames }
+
+    const api = {
+      begin(label) { capturing = { label, frames: [] }; },
+      addFrame(lm) { if (capturing) capturing.frames.push(Array.from(normalize(lm))); },
+      end() {
+        if (!capturing) return null;
+        const { label, frames } = capturing;
+        capturing = null;
+        if (frames.length < 2) return null;
+        const st = stats(frames);
+        data[label] = { frames, centroid: Array.from(st.centroid), std: Array.from(st.std) };
+        return { label, count: frames.length };
+      },
+      has() { return Object.keys(data).length >= 2; },
+      labels() { return Object.keys(data); },
+      frames(label) { return data[label] ? data[label].frames : []; },
+      models() {
+        const m = {};
+        for (const l of Object.keys(data)) m[l] = { centroid: data[l].centroid, std: data[l].std };
+        return m;
+      },
+      clear() { for (const k of Object.keys(data)) delete data[k]; capturing = null; },
+      save() {
+        if (typeof localStorage === 'undefined') return false;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ v: 1, data }));
+        return true;
+      },
+      load() {
+        if (typeof localStorage === 'undefined') return false;
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return false;
+        try {
+          const parsed = JSON.parse(raw);
+          if (!parsed || parsed.v !== 1) return false;
+          api.clear();
+          for (const l of Object.keys(parsed.data)) data[l] = parsed.data[l];
+          return true;
+        } catch (e) { return false; }
+      },
+      // leave-one-out over all stored frames → { accuracy, matrix, labels, total }
+      leaveOneOut() {
+        const labels = Object.keys(data);
+        const idx = Object.fromEntries(labels.map((l, i) => [l, i]));
+        const matrix = labels.map(() => labels.map(() => 0));
+        let correct = 0, total = 0;
+        for (const l of labels) {
+          const frames = data[l].frames;
+          for (let k = 0; k < frames.length; k++) {
+            const models = api.models();
+            const rest = frames.filter((_, j) => j !== k);
+            if (rest.length >= 2) {
+              const st = stats(rest);
+              models[l] = { centroid: st.centroid, std: st.std };
+            }
+            const pred = nearest(frames[k], models).chord;
+            matrix[idx[l]][idx[pred]]++;
+            if (pred === l) correct++;
+            total++;
+          }
+        }
+        return { accuracy: total ? correct / total : 0, matrix, labels, total };
+      },
+    };
+    return api;
+  }
+
+  const calib = createCalib();
+
+  function classifyCalibrated(lm, store = calib) {
+    if (!store.has()) return { chord: null, confidence: 0 };
+    return nearest(normalize(lm), store.models());
+  }
+
+  function classify(lm, store = calib) {
+    const c = curls(lm);
+    if (store.has()) {
+      const r = classifyCalibrated(lm, store);
+      return { chord: r.chord, confidence: r.confidence, curls: c, method: 'calib' };
+    }
+    const r = classifyRules(c);
+    return { chord: r.chord, confidence: r.confidence, curls: c, method: 'rules' };
+  }
+
+  // ---- temporal voter -------------------------------------------------------
+  function createVoter({ window = 5, minVotes = 3, minConfidence = 0.5 } = {}) {
+    const buf = [];
+    let current = null, currentConf = 0;
+    function tally() {
+      const votes = {}, confs = {};
+      for (const r of buf) {
+        if (!r || !r.chord) continue;
+        votes[r.chord] = (votes[r.chord] || 0) + 1;
+        confs[r.chord] = (confs[r.chord] || 0) + (r.confidence || 0);
+      }
+      let winner = null, n = 0;
+      for (const k of Object.keys(votes)) if (votes[k] > n) { n = votes[k]; winner = k; }
+      return { winner, n, meanConf: winner ? confs[winner] / n : 0, votes, confs };
+    }
+    return {
+      push(result) {
+        buf.push(result || { chord: null, confidence: 0 });
+        if (buf.length > window) buf.shift();
+        const t = tally();
+        if (t.winner && t.winner !== current && t.n >= minVotes && t.meanConf >= minConfidence) {
+          current = t.winner;
+        }
+        if (current && t.votes[current]) currentConf = t.confs[current] / t.votes[current];
+        const stable = !!current && (t.votes[current] || 0) >= minVotes;
+        return { chord: current, confidence: currentConf, stable };
+      },
+      current() { return { chord: current, confidence: currentConf }; },
+      reset() { buf.length = 0; current = null; currentConf = 0; },
+    };
+  }
+
+  // ---- synthetic hand (for V8 and demos) ------------------------------------
+  // Built in a local frame (x right, y up, thumb on −x), then mapped to image
+  // coords with the wrist at (0.5, 0.8) and y flipped (image y grows downward).
+  function syntheticHand(down = {}, opts = {}) {
+    const scale = opts.scale || 1;
+    const mcps = { index: [-0.07, 0.19], middle: [0, 0.20], ring: [0.06, 0.19], pinky: [0.11, 0.17] };
+    const local = new Array(21);
+    local[WRIST] = [0, 0, 0];
+    // thumb, angled out on the −x side
+    local[1] = [-0.06, 0.05, 0]; local[2] = [-0.11, 0.10, 0]; local[3] = [-0.15, 0.14, 0]; local[4] = [-0.18, 0.17, 0];
+    for (const f of FINGER_NAMES) {
+      const [mx, my] = mcps[f];
+      const d = Math.hypot(mx, my), ux = mx / d, uy = my / d;
+      const [iM, iP, iD, iT] = FINGERS[f];
+      local[iM] = [mx, my, 0];
+      if (down[f]) {
+        // folded: PIP a little past the knuckle, DIP/TIP curl back toward the palm
+        local[iP] = [ux * d * 1.25, uy * d * 1.25, -0.02];
+        local[iD] = [ux * d * 1.15, uy * d * 1.15, -0.06];
+        local[iT] = [ux * d * 0.95, uy * d * 0.95, -0.07];
+      } else {
+        local[iP] = [ux * d * 1.30, uy * d * 1.30, 0];
+        local[iD] = [ux * d * 1.60, uy * d * 1.60, 0];
+        local[iT] = [ux * d * 1.90, uy * d * 1.90, 0];
+      }
+    }
+    return local.map(([x, y, z]) => ({ x: 0.5 + x * scale, y: 0.8 - y * scale, z: z * scale }));
+  }
+
+  // rotate landmarks about the wrist by `deg` in image coords
+  function rotateHand(lm, deg) {
+    const w = lm[WRIST], a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+    return lm.map(p => ({
+      x: w.x + (p.x - w.x) * c - (p.y - w.y) * s,
+      y: w.y + (p.x - w.x) * s + (p.y - w.y) * c,
+      z: p.z,
+    }));
+  }
+  const mirrorHand = lm => lm.map(p => ({ x: 1 - p.x, y: p.y, z: p.z }));
+
+  const LABEL_DOWN = {
+    open: {}, C: { ring: true }, Am: { middle: true },
+    F: { index: true, middle: true }, G: { index: true, middle: true, ring: true },
+    mute: { index: true, middle: true, ring: true, pinky: true },
+  };
+
+  // ---- V8 self-test ---------------------------------------------------------
+  function selfTest(opts = {}) {
+    const lines = [];
+    let pass = true;
+    const fmt = c => FINGER_NAMES.map(f => `${f[0]}=${c[f].toFixed(2)}`).join(' ');
+
+    // (a) rule table on synthetic hands
+    for (const r of RULES) {
+      const down = Object.fromEntries(FINGER_NAMES.map((f, i) => [f, !!r.down[i]]));
+      const lm = syntheticHand(down);
+      const c = curls(lm);
+      const res = classifyRules(c);
+      const ok = res.chord === r.chord;
+      if (!ok) pass = false;
+      lines.push(`${ok ? 'PASS' : 'FAIL'} rules ${r.chord.padEnd(4)} → ${String(res.chord).padEnd(4)} conf ${res.confidence.toFixed(2)}  [${fmt(c)}]`);
+    }
+
+    // (a') invariance: mirror + 40° rotation must not change curls or the frame
+    {
+      const base = syntheticHand(LABEL_DOWN.G);
+      const alt = rotateHand(mirrorHand(base), 40);
+      const c0 = curls(base), c1 = curls(alt);
+      const n0 = normalize(base), n1 = normalize(alt);
+      let curlErr = 0, frameErr = 0;
+      for (const f of FINGER_NAMES) curlErr = Math.max(curlErr, Math.abs(c0[f] - c1[f]));
+      for (let i = 0; i < 63; i++) frameErr = Math.max(frameErr, Math.abs(n0[i] - n1[i]));
+      const ok = curlErr <= 0.02 && frameErr <= 0.05;
+      if (!ok) pass = false;
+      lines.push(`${ok ? 'PASS' : 'FAIL'} invariance mirror+40°: max curl Δ ${curlErr.toFixed(3)}, max frame Δ ${frameErr.toFixed(3)}`);
+    }
+
+    // (b) calibration: stored store, or a synthetic one on request
+    let store = calib.has() ? calib : null;
+    if (!store && opts.syntheticCalib) {
+      store = createCalib();
+      let seed = 12345;
+      const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+      const gauss = () => { const u = rnd() || 1e-9, v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+      for (const label of ['C', 'G', 'Am', 'F', 'open']) {
+        store.begin(label);
+        for (let k = 0; k < 60; k++) {
+          let lm = syntheticHand(LABEL_DOWN[label]);
+          lm = lm.map(p => ({ x: p.x + gauss() * 0.01, y: p.y + gauss() * 0.01, z: p.z + gauss() * 0.01 }));
+          lm = rotateHand(lm, (rnd() * 2 - 1) * 20);
+          if (rnd() < 0.5) lm = mirrorHand(lm);
+          store.addFrame(lm);
+        }
+        store.end();
+      }
+      lines.push('calibration: synthetic (60 jittered frames × 5 labels)');
+    }
+    if (store) {
+      const r = store.leaveOneOut();
+      const ok = r.accuracy >= 0.90;
+      if (!ok) pass = false;
+      lines.push(`${ok ? 'PASS' : 'FAIL'} calibration leave-one-out accuracy ${(r.accuracy * 100).toFixed(1)}% over ${r.total} frames`);
+      lines.push('      ' + r.labels.map(l => l.padStart(5)).join(''));
+      r.labels.forEach((l, i) => lines.push(l.padEnd(6) + r.matrix[i].map(v => String(v).padStart(5)).join('')));
+    } else {
+      lines.push('calibration: none stored (rules active)');
+    }
+
+    lines.unshift(pass ? 'V8 CHORD RULES OK' : 'V8 CHORD FAILED');
+    return { pass, lines };
+  }
+
+  return {
+    params, FINGER_NAMES, LABEL_DOWN,
+    normalize, curls, classifyRules, classifyCalibrated, classify,
+    calib, createCalib, createVoter,
+    syntheticHand, rotateHand, mirrorHand, selfTest,
+  };
+})();
+
+
+// ==========================================================================
+// SECTION uke/ + strum/  (src/strum.js)
+// ==========================================================================
+// ============================================================================
+// uke/  — fixed on-screen instrument frame and screen ↔ local transform
+// ----------------------------------------------------------------------------
+// Screen coords are NORMALIZED (0..1, x already mirrored by tracking, y down).
+// Local frame: origin at the bridge, +x along the neck toward the headstock
+// (screen-left), +y across the strings (screen-down when the neck is level).
+// Strings are horizontal lines in local coords at y_i = (i − 1.5)·spacing,
+// i = 0..3  (0 = G top … 3 = A bottom), spanning local x ∈ [0, length].
+//
+// `aspect` (default 1) lets the integrator make the geometry isotropic on a
+// non-square canvas: screen (x,y) → iso (x·aspect, y) before the rotation, so
+// a −15° neck really is 15° on a 16:9 canvas. With aspect ≠ 1, lengths are in
+// "frame heights" (0.55 ≈ 0.31 of width on 16:9) — bump `length` accordingly.
+// Pure math except draw(), which is guarded.
+// ============================================================================
+const UkeFrame = (() => {
+  // Default geometry — lower-centre of a 16:9 frame with hands naturally placed.
+  const state = {
+    bridge: { x: 0.68, y: 0.62 },
+    angleDeg: -15,   // negative = headstock rises up-left
+    length: 0.55,    // bridge → nut (scale length) in normalized units
+    spacing: 0.045,  // string-to-string distance in normalized units
+    aspect: 1,       // canvas w/h for isotropic geometry; 1 = pure normalized
+  };
+
+  // Unit vectors of the local axes in iso-screen coords.
+  // Neck direction u points screen-left; for a<0 it also points up (y down).
+  function axes() {
+    const a = (state.angleDeg * Math.PI) / 180;
+    const u = { x: -Math.cos(a), y: Math.sin(a) };  // local +x
+    const v = { x: Math.sin(a), y: Math.cos(a) };   // local +y (perpendicular, down when a=0)
+    return { u, v };
+  }
+
+  function set(opts = {}) {
+    if (opts.bridge) state.bridge = { x: opts.bridge.x, y: opts.bridge.y };
+    if (typeof opts.angleDeg === 'number') state.angleDeg = opts.angleDeg;
+    if (typeof opts.length === 'number') state.length = opts.length;
+    if (typeof opts.spacing === 'number') state.spacing = opts.spacing;
+    if (typeof opts.aspect === 'number' && opts.aspect > 0) state.aspect = opts.aspect;
+    return get();
+  }
+  function get() {
+    return { bridge: { ...state.bridge }, angleDeg: state.angleDeg,
+             length: state.length, spacing: state.spacing, aspect: state.aspect };
+  }
+
+  function toLocal(p) {
+    const { u, v } = axes();
+    const dx = (p.x - state.bridge.x) * state.aspect;
+    const dy = p.y - state.bridge.y;
+    return { x: dx * u.x + dy * u.y, y: dx * v.x + dy * v.y };
+  }
+  function toScreen(l) {
+    const { u, v } = axes();
+    const ix = l.x * u.x + l.y * v.x;
+    const iy = l.x * u.y + l.y * v.y;
+    return { x: state.bridge.x + ix / state.aspect, y: state.bridge.y + iy };
+  }
+
+  function stringLocalYs() {
+    return [0, 1, 2, 3].map(i => (i - 1.5) * state.spacing);
+  }
+  function stringScreenSegments() {
+    return stringLocalYs().map(y => ({
+      a: toScreen({ x: 0, y }),
+      b: toScreen({ x: state.length, y }),
+    }));
+  }
+  // Crossings only count in this local-x band over the body — waving over the
+  // neck must not pluck.
+  function strumZone() {
+    return [0.05 * state.length, 0.45 * state.length];
+  }
+  // Where the fretting hand has to be for a chord to count as fretted. The board is drawn
+  // 0.46L → L with half-width 2·spacing; the margins let fingertips sit a little above/below
+  // the board (the hand hovers over it on camera) and past the nut.
+  function neckZone() {
+    return { x0: 0.40 * state.length, x1: 1.08 * state.length, yHalf: 4 * state.spacing };
+  }
+
+  // Aim the neck from the strumming tip toward the fretting wrist and place the
+  // bridge so the tip sits at 25% of the scale length, 2.5 string spacings ABOVE the
+  // top string (on the "armed" side of the string band): a resting hand recentred with C
+  // must not be parked on a string line, or jitter would pluck it.
+  const RECENTER_TIP_Y = spacing => -(1.5 + 2.5) * spacing;
+  function recenter(frettingWrist, strummingTip) {
+    if (!frettingWrist || !strummingTip) return get();
+    const ax = (frettingWrist.x - strummingTip.x) * state.aspect;
+    const ay = frettingWrist.y - strummingTip.y;
+    const n = Math.hypot(ax, ay);
+    if (n < 1e-6) return get();
+    const ux = ax / n, uy = ay / n;
+    // u = (−cos a, sin a)  ⇒  a = atan2(uy, −ux); clamp to a sane playing tilt
+    let a = Math.atan2(uy, -ux);
+    const lim = (40 * Math.PI) / 180;
+    a = Math.max(-lim, Math.min(lim, a));
+    state.angleDeg = (a * 180) / Math.PI;
+    const { u, v } = axes();
+    const d = 0.25 * state.length, ty = RECENTER_TIP_Y(state.spacing);
+    // tip_local = (d, ty)  ⇒  bridge = tip − (d·u + ty·v) in iso coords
+    state.bridge = {
+      x: strummingTip.x - (d * u.x + ty * v.x) / state.aspect,
+      y: strummingTip.y - (d * u.y + ty * v.y),
+    };
+    return get();
+  }
+
+  // Appearance only — geometry lives above. Tweak freely.
+  const theme = {
+    wood: ['#5e3418', '#8a5230', '#a8683b'],   // koa/mahogany top, dark → light across the body
+    woodAlpha: 0.86,
+    woodSheen: 'rgba(255, 220, 170, 0.18)',
+    binding: 'rgba(38, 22, 12, 0.95)',
+    bindingInner: 'rgba(255, 232, 196, 0.35)',
+    soundhole: ['#1c110a', '#050302'],
+    rosette: '#f5b74a',
+    rosetteDark: 'rgba(50, 28, 14, 0.9)',
+    fretboard: '#2a1a12',
+    fretboardAlpha: 0.94,
+    grain: 'rgba(255, 255, 255, 0.045)',
+    nut: '#efe6d2',
+    fret: '#d9d9d9',
+    fretShadow: 'rgba(30, 30, 30, 0.75)',
+    dot: '#e8e2d0',
+    headstock: '#22140d',
+    tuner: '#cfd3d6',
+    tunerRing: 'rgba(0,0,0,0.5)',
+    bridge: '#2a1a12',
+    saddle: '#efe6d2',
+    string: '#f2eee6',
+    stringShadow: 'rgba(60, 50, 35, 0.55)',
+    stringWidths: [2.4, 3.0, 2.0, 1.5],        // px: G C E A — the C string is thickest, A thinnest
+    highlight: '#ffd27a',
+    glow: 'rgba(245, 183, 74, 0.95)',
+    zone: 'rgba(245, 183, 74, 0.06)',
+    shadow: 'rgba(0, 0, 0, 0.35)',
+  };
+
+  // Optional rendering. ctx2d is a CanvasRenderingContext2D; w,h in pixels.
+  // Draws in LOCAL coordinates through the exact local→screen affine, so every
+  // element lands where toScreen() says it does; only the looks changed.
+  function draw(ctx, w, h, opts = {}) {
+    if (!ctx || typeof ctx.beginPath !== 'function') return;
+    const highlight = opts.highlight || [];
+    const L = state.length, s = state.spacing;
+
+    // local → device-pixel affine from three probe points
+    const o = toScreen({ x: 0, y: 0 }), ex = toScreen({ x: 1, y: 0 }), ey = toScreen({ x: 0, y: 1 });
+    const m = { a: (ex.x - o.x) * w, b: (ex.y - o.y) * h, c: (ey.x - o.x) * w, d: (ey.y - o.y) * h, e: o.x * w, f: o.y * h };
+    const k = Math.hypot(m.a, m.b) || 1;   // pixels per local unit
+    const px = 1 / k;                      // one device pixel in local units
+    const safe = fn => { try { return fn(); } catch (e) { return null; } };
+    const T = theme;
+
+    // Closed Catmull-Rom spline → cubic beziers
+    const spline = pts => {
+      const n = pts.length;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 0; i < n; i++) {
+        const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+        ctx.bezierCurveTo(p1.x + (p2.x - p0.x) / 6, p1.y + (p2.y - p0.y) / 6,
+                          p2.x - (p3.x - p1.x) / 6, p2.y - (p3.y - p1.y) / 6, p2.x, p2.y);
+      }
+      ctx.closePath();
+    };
+    const rrect = (x0, y0, x1, y1, r) => {
+      ctx.beginPath();
+      ctx.moveTo(x0 + r, y0); ctx.lineTo(x1 - r, y0); ctx.quadraticCurveTo(x1, y0, x1, y0 + r);
+      ctx.lineTo(x1, y1 - r); ctx.quadraticCurveTo(x1, y1, x1 - r, y1);
+      ctx.lineTo(x0 + r, y1); ctx.quadraticCurveTo(x0, y1, x0, y1 - r);
+      ctx.lineTo(x0, y0 + r); ctx.quadraticCurveTo(x0, y0, x0 + r, y0);
+      ctx.closePath();
+    };
+    const line = (x0, y0, x1, y1) => { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); };
+    const circle = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); };
+
+    ctx.save();
+    if (typeof ctx.transform === 'function') ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    // ---- body: figure-8 soprano silhouette (tail at −0.16L, neck joint at 0.50L) ----
+    const outline = [
+      [-0.160, 0.0], [-0.135, 1.7], [-0.060, 2.85], [0.040, 3.15], [0.130, 2.95], [0.200, 2.45],
+      [0.250, 2.20], [0.305, 2.35], [0.375, 2.62], [0.440, 2.35], [0.490, 1.55], [0.500, 0.0],
+      [0.490, -1.55], [0.440, -2.35], [0.375, -2.62], [0.305, -2.35], [0.250, -2.20], [0.200, -2.45],
+      [0.130, -2.95], [0.040, -3.15], [-0.060, -2.85], [-0.135, -1.7],
+    ].map(([x, y]) => ({ x: x * L, y: y * s }));
+
+    // drop shadow (device-space offsets, deliberately not transformed)
+    ctx.save();
+    ctx.shadowColor = T.shadow; ctx.shadowBlur = 22; ctx.shadowOffsetY = 8;
+    spline(outline);
+    ctx.fillStyle = 'rgba(60, 35, 18, 0.9)';
+    ctx.fill();
+    ctx.restore();
+
+    // wood top
+    spline(outline);
+    ctx.globalAlpha = T.woodAlpha;
+    const wg = safe(() => ctx.createLinearGradient(0, -3.2 * s, 0, 3.2 * s));
+    if (wg) { wg.addColorStop(0, T.wood[0]); wg.addColorStop(0.5, T.wood[2]); wg.addColorStop(1, T.wood[1]); ctx.fillStyle = wg; }
+    else ctx.fillStyle = T.wood[1];
+    ctx.fill();
+    // soft sheen along the top edge
+    const sg = safe(() => ctx.createLinearGradient(0, -3.2 * s, 0, 0.5 * s));
+    if (sg) { sg.addColorStop(0, T.woodSheen); sg.addColorStop(1, 'rgba(255,220,170,0)'); ctx.fillStyle = sg; ctx.fill(); }
+    // faint grain lines
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = T.grain; ctx.lineWidth = 1 * px;
+    for (let g = -2.8; g <= 2.8; g += 0.45) line(-0.14 * L, g * s, 0.48 * L, g * s * 0.92);
+    // binding: dark edge + thin cream inner line
+    spline(outline);
+    ctx.strokeStyle = T.binding; ctx.lineWidth = 2.2 * px; ctx.stroke();
+    spline(outline);
+    ctx.strokeStyle = T.bindingInner; ctx.lineWidth = 0.8 * px; ctx.stroke();
+
+    // ---- soundhole + rosette ----
+    const shx = 0.16 * L, shr = 1.05 * s;
+    circle(shx, 0, shr);
+    const hg = safe(() => ctx.createRadialGradient(shx, 0, shr * 0.2, shx, 0, shr));
+    if (hg) { hg.addColorStop(0, T.soundhole[1]); hg.addColorStop(1, T.soundhole[0]); ctx.fillStyle = hg; } else ctx.fillStyle = T.soundhole[0];
+    ctx.fill();
+    circle(shx, 0, shr + 2.5 * px); ctx.strokeStyle = T.rosetteDark; ctx.lineWidth = 3 * px; ctx.stroke();
+    circle(shx, 0, shr + 5.5 * px); ctx.strokeStyle = T.rosette; ctx.lineWidth = 2 * px; ctx.stroke();
+    circle(shx, 0, shr + 9 * px); ctx.strokeStyle = T.rosetteDark; ctx.lineWidth = 1.2 * px; ctx.stroke();
+
+    // ---- strum zone: barely-there soft band over the body ----
+    const [z0, z1] = strumZone();
+    ctx.fillStyle = T.zone;
+    rrect(z0, -2.6 * s, z1, 2.6 * s, 0.6 * s); ctx.fill();
+
+    // ---- headstock (beyond the nut) ----
+    const nw = 2.0 * s;
+    // Kept slim and pushed outward so the annotation layer's string names / open markers
+    // just beyond the nut stay readable.
+    const hs0 = L, hs1 = L + 0.17 * L;
+    ctx.fillStyle = T.headstock;
+    ctx.globalAlpha = T.fretboardAlpha;
+    rrect(hs0 - 0.5 * px, -1.15 * nw, hs1, 1.15 * nw, 0.9 * s); ctx.fill();
+    ctx.globalAlpha = 1;
+    rrect(hs0 - 0.5 * px, -1.15 * nw, hs1, 1.15 * nw, 0.9 * s);
+    ctx.strokeStyle = T.binding; ctx.lineWidth = 1.5 * px; ctx.stroke();
+    // tuners: two per side
+    for (const tx of [hs0 + 0.095 * L, hs0 + 0.14 * L]) {
+      for (const ty of [-0.85 * nw, 0.85 * nw]) {
+        circle(tx, ty, 0.30 * s); ctx.fillStyle = T.tuner; ctx.fill();
+        ctx.strokeStyle = T.tunerRing; ctx.lineWidth = 1 * px; ctx.stroke();
+        circle(tx, ty, 0.12 * s); ctx.fillStyle = T.tunerRing; ctx.fill();
+      }
+    }
+
+    // ---- neck / fretboard (0.46L → L) ----
+    ctx.globalAlpha = T.fretboardAlpha;
+    ctx.fillStyle = T.fretboard;
+    ctx.beginPath();
+    ctx.moveTo(0.46 * L, -nw); ctx.lineTo(L, -nw); ctx.lineTo(L, nw); ctx.lineTo(0.46 * L, nw); ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // grain highlight along the fretboard
+    ctx.strokeStyle = T.grain; ctx.lineWidth = 1 * px;
+    for (let g = -0.75; g <= 0.75; g += 0.5) line(0.47 * L, g * nw, L, g * nw);
+    // edges
+    ctx.strokeStyle = T.binding; ctx.lineWidth = 1.2 * px;
+    line(0.46 * L, -nw, L, -nw); line(0.46 * L, nw, L, nw);
+
+    // frets: distance from the bridge = L·2^(−n/12) (equal temperament); draw to the body joint
+    const fretX = n => L * Math.pow(2, -n / 12);
+    for (let n = 1; n <= 12; n++) {
+      const x = fretX(n);
+      if (x < 0.47 * L) break;
+      ctx.strokeStyle = T.fretShadow; ctx.lineWidth = 1.2 * px; line(x - 1.2 * px, -nw, x - 1.2 * px, nw);
+      ctx.strokeStyle = T.fret; ctx.lineWidth = 1.8 * px; line(x, -nw, x, nw);
+    }
+    // pearl position dots at frets 5 and 7 (centred in the fret space)
+    for (const n of [5, 7]) {
+      const x = (fretX(n - 1) + fretX(n)) / 2;
+      if (x < 0.47 * L) continue;
+      circle(x, 0, 0.26 * s); ctx.fillStyle = T.dot; ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 0.8 * px; ctx.stroke();
+    }
+    // nut (bone)
+    ctx.strokeStyle = T.nut; ctx.lineWidth = 4 * px; line(L, -nw, L, nw);
+
+    // ---- bridge + saddle (strings start at local x = 0) ----
+    ctx.fillStyle = T.bridge;
+    rrect(-0.035 * L, -2.2 * s, 0.02 * L, 2.2 * s, 0.35 * s); ctx.fill();
+    ctx.strokeStyle = T.binding; ctx.lineWidth = 1 * px; ctx.stroke();
+    ctx.strokeStyle = T.saddle; ctx.lineWidth = 3 * px; line(0, -1.9 * s, 0, 1.9 * s);
+
+    // ---- strings ----
+    stringLocalYs().forEach((y, i) => {
+      const wpx = T.stringWidths[i] * px;
+      // shadow line for depth
+      ctx.strokeStyle = T.stringShadow; ctx.lineWidth = wpx; line(0, y + 1.2 * px, L, y + 1.2 * px);
+      if (highlight[i]) {
+        ctx.save();
+        ctx.shadowColor = T.glow; ctx.shadowBlur = 14;
+        ctx.strokeStyle = T.highlight; ctx.lineWidth = wpx * 1.5; line(0, y, L, y);
+        ctx.restore();
+      } else {
+        ctx.strokeStyle = T.string; ctx.lineWidth = wpx; line(0, y, L, y);
+      }
+    });
+
+    ctx.restore();
+  }
+
+  return { set, get, toLocal, toScreen, stringLocalYs, stringScreenSegments,
+           strumZone, neckZone, recenter, RECENTER_TIP_Y, draw, theme };
+})();
+
+// ============================================================================
+// strum/  — sub-frame string-crossing solver, scheduler, keyboard strum, V4
+// ----------------------------------------------------------------------------
+// A strum crosses four strings in ~60 ms = two camera frames. We never test
+// "fingertip inside a rectangle". For consecutive samples (y0,t0),(y1,t1) each
+// string with y_i strictly between gets its crossing time by interpolation:
+//     τ_i = t0 + (y_i − y0)/(y1 − y0) · (t1 − t0)
+// Relative offsets τ_i − τ_min are then preserved when scheduling audio.
+// ============================================================================
+const Strum = (() => {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // A fast strum crosses the 0.135 string span in ~50 ms ≈ 2.7 local units/s.
+  const V_MAX = 3.0;
+
+  function velocityToAmp(v, minVelocity) {
+    return clamp(0.3 + 0.7 * (v - minVelocity) / (V_MAX - minVelocity), 0.3, 1.0);
+  }
+
+  // Three guards keep a hand that is merely *near* the strings silent:
+  //  1. hysteresis — each string remembers which side the tip is on and only flips when
+  //     the tip is clearly past the line (dead band), so a parked, jittering tip never
+  //     "crosses" anything;
+  //  2. speed gate — a per-sample speed above 2·V_MAX is a tracker glitch (or a role
+  //     swap teleporting the tip between hands), not a finger, and resyncs instead of raking;
+  //  3. stroke arming — crossings only count after the tip was seen OUTSIDE the string
+  //     band inside the strum zone (a real stroke starts above or below the strings);
+  //     a tip that appears inside the band, or loiters there, is disarmed.
+  function createDetector(opts = {}) {
+    const stringYs = opts.stringYs || UkeFrame.stringLocalYs();
+    const zoneX = opts.zoneX || UkeFrame.strumZone();
+    const spacing = opts.spacing ?? (stringYs.length > 1 ? Math.abs(stringYs[1] - stringYs[0]) : 0.045);
+    const debounceMs = opts.debounceMs ?? 40;     // one string cannot retrigger faster than this
+    const maxJump = opts.maxJump ?? 0.4;          // hard bound: larger Δ in one sample is never a finger
+    const maxSpeed = opts.maxSpeed ?? 2 * V_MAX;  // u/s; twice the fastest strum — glitch above this (frame-rate independent)
+    const minVelocity = opts.minVelocity ?? 0.4;  // u/s; a lazy 300 ms full strum ≈ 0.42, tracker jitter < 0.2
+    const band = opts.band ?? 0.3 * spacing;      // hysteresis dead band ≈ 9 px at 720p, ~2× fingertip jitter
+    const outerY = 1.5 * spacing + band;          // |y| beyond this = outside the string band (arming zone)
+    const strokeMaxMs = opts.strokeMaxMs ?? 400;  // a stroke through 3 spacings at minVelocity takes ~340 ms; longer = loitering
+
+    let prev = null;
+    let lastV = 0;
+    let armed = false, enteredBandMs = null;
+    const side = new Array(stringYs.length).fill(0);   // −1 above (y < y_i), +1 below, 0 unknown
+    const lastPluck = new Array(stringYs.length).fill(-Infinity);
+
+    const inZone = x => x >= zoneX[0] && x <= zoneX[1];
+    function sideOf(y, yi) { return y < yi - band ? -1 : y > yi + band ? 1 : 0; }
+    function initSides(y) { for (let i = 0; i < stringYs.length; i++) side[i] = sideOf(y, stringYs[i]); }
+    function updateArming(s) {
+      if (Math.abs(s.y) > outerY) {               // outside the band: arm iff over the body
+        armed = inZone(s.x);
+        enteredBandMs = null;
+      } else {
+        if (enteredBandMs == null) enteredBandMs = s.t;
+        if (armed && s.t - enteredBandMs > strokeMaxMs) armed = false;   // loitering among the strings
+      }
+    }
+    function resync(s) { prev = s; initSides(s.y); armed = false; enteredBandMs = null; updateArming(s); }
+
+    function push(s) {
+      if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y) || !Number.isFinite(s.t)) {
+        prev = null; side.fill(0); armed = false; enteredBandMs = null; return [];
+      }
+      if (!prev) { resync(s); return []; }
+      const dx = s.x - prev.x, dy = s.y - prev.y, dt = s.t - prev.t;
+      if (dt <= 0) { prev = s; return []; }
+      const speed = (Math.hypot(dx, dy) / dt) * 1000;
+      if (Math.abs(dx) > maxJump || Math.abs(dy) > maxJump || speed > maxSpeed) { resync(s); return []; } // glitch: resync
+
+      const v = (Math.abs(dy) / dt) * 1000; // local units per second, across the strings
+      lastV = v;
+      const out = [];
+      const wasArmed = armed;                 // arming state as of `prev` governs this segment
+      const dir = dy > 0 ? 1 : -1;            // +1 = downstroke G→A
+      for (let i = 0; i < stringYs.length; i++) {
+        const yi = stringYs[i];
+        const ns = sideOf(s.y, yi);
+        if (ns === 0) continue;                              // in the dead band: side unchanged
+        const flipped = side[i] !== 0 && ns !== side[i];
+        side[i] = ns;
+        if (!flipped || !wasArmed || v < minVelocity) continue;
+        const f = clamp((yi - prev.y) / (dy || 1e-9), 0, 1);   // prev may sit inside the dead band
+        const tau = prev.t + f * dt;
+        const xAt = prev.x + f * dx;
+        if (!inZone(xAt)) continue;                          // over the neck, not the body
+        if (tau - lastPluck[i] < debounceMs) continue;
+        lastPluck[i] = tau;
+        out.push({ string: i, velocity: velocityToAmp(v, minVelocity), tMs: tau, dir });
+      }
+      out.sort((a, b) => a.tMs - b.tMs);
+      updateArming(s);
+      prev = s;
+      return out;
+    }
+    function reset() { prev = null; lastV = 0; lastPluck.fill(-Infinity); side.fill(0); armed = false; enteredBandMs = null; }
+    function lastVelocity() { return lastV; }
+    function isArmed() { return armed; }
+    return { push, reset, lastVelocity, isArmed, params: { band, minVelocity, maxSpeed, outerY, strokeMaxMs } };
+  }
+
+  // τ (ms, performance.now domain) → AudioContext seconds, exact relative rake,
+  // all in the future. nowMs is accepted for symmetry / future latency comp.
+  function schedule(plucks, audioNowSec, nowMs) { // eslint-disable-line no-unused-vars
+    if (!plucks || !plucks.length) return [];
+    const tMin = Math.min(...plucks.map(p => p.tMs));
+    return plucks.map(p => ({
+      string: p.string, velocity: p.velocity, dir: p.dir,
+      when: audioNowSec + (p.tMs - tMin) / 1000,
+    }));
+  }
+
+  // Keyboard / mouse-button strum: all 4 strings always play on a uke.
+  function keyboardStrum(chordFrets, dir = 1, rakeMs = 12, audioNowSec = 0, velocity = 0.8) {
+    const order = dir >= 0 ? [0, 1, 2, 3] : [3, 2, 1, 0];
+    return order.map((string, k) => ({
+      string, velocity, dir: dir >= 0 ? 1 : -1,
+      when: audioNowSec + (k * rakeMs) / 1000,
+    }));
+  }
+
+  // -------------------------------------------------------------- V4 self-test
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push(`${ok ? 'PASS' : 'FAIL'} ${msg}`); };
+
+    const spacing = 0.045;
+    const ys = [0, 1, 2, 3].map(i => (i - 1.5) * spacing); // ±0.0675, ±0.0225
+    const zone = [0.05 * 0.55, 0.45 * 0.55];                 // [0.0275, 0.2475]
+    const xIn = 0.12, xOut = 0.40;
+    const mk = () => createDetector({ stringYs: ys, zoneX: zone });
+
+    // (a) top→bottom, 60 ms, 3 samples, inside zone
+    {
+      const d = mk();
+      const pl = [
+        ...d.push({ x: xIn, y: -0.10, t: 0 }),
+        ...d.push({ x: xIn, y: 0.00, t: 30 }),
+        ...d.push({ x: xIn, y: 0.10, t: 60 }),
+      ];
+      check(pl.length === 4, `(a) 4 plucks from a 60 ms downstroke (got ${pl.length})`);
+      check(pl.map(p => p.string).join() === '0,1,2,3', `(a) strings in order 0,1,2,3 (got ${pl.map(p => p.string).join()})`);
+      const inc = pl.every((p, i) => i === 0 || p.tMs > pl[i - 1].tMs);
+      check(inc, `(a) strictly increasing τ: ${pl.map(p => p.tMs.toFixed(2)).join(' → ')} ms`);
+      const span = pl.length ? pl[pl.length - 1].tMs - pl[0].tMs : 0;
+      check(span >= 40 && span <= 80, `(a) rake span ${span.toFixed(2)} ms within 40–80`);
+      check(pl.every(p => p.dir === 1), `(a) dir = +1 (downstroke)`);
+      check(pl.every(p => p.velocity >= 0.3 && p.velocity <= 1.0), `(a) amplitudes in [0.3,1]: ${pl.map(p => p.velocity.toFixed(2)).join(',')}`);
+      const sch = schedule(pl, 100.0, 60);
+      const rel = sch.map(s => ((s.when - 100.0) * 1000).toFixed(2));
+      check(sch[0] && Math.abs(sch[0].when - 100.0) < 1e-9 && sch.every((s, i) => i === 0 || s.when > sch[i - 1].when),
+        `(a) schedule() preserves rake from audioNow: +${rel.join(', +')} ms`);
+    }
+    // (b) reversed path → 3,2,1,0, dir −1
+    {
+      const d = mk();
+      const pl = [
+        ...d.push({ x: xIn, y: 0.10, t: 0 }),
+        ...d.push({ x: xIn, y: 0.00, t: 30 }),
+        ...d.push({ x: xIn, y: -0.10, t: 60 }),
+      ];
+      check(pl.map(p => p.string).join() === '3,2,1,0', `(b) upstroke order 3,2,1,0 (got ${pl.map(p => p.string).join()})`);
+      check(pl.length === 4 && pl.every(p => p.dir === -1), `(b) dir = −1`);
+    }
+    // (c) outside zone → 0
+    {
+      const d = mk();
+      const pl = [
+        ...d.push({ x: xOut, y: -0.10, t: 0 }),
+        ...d.push({ x: xOut, y: 0.00, t: 30 }),
+        ...d.push({ x: xOut, y: 0.10, t: 60 }),
+      ];
+      check(pl.length === 0, `(c) 0 plucks when x is over the neck (got ${pl.length})`);
+    }
+    // (d) armed stroke to just past string 2, then back across it within 10 ms → string 2 plucks once
+    {
+      const d = mk();
+      const y2 = ys[2];
+      const pl = [
+        ...d.push({ x: xIn, y: -0.10, t: 0 }),           // outside the band: arms the stroke
+        ...d.push({ x: xIn, y: y2 + 0.02, t: 30 }),      // crosses strings 0, 1, 2
+        ...d.push({ x: xIn, y: y2 - 0.02, t: 40 }),      // back over string 2 inside the debounce
+      ];
+      const n2 = pl.filter(p => p.string === 2).length;
+      check(n2 === 1 && pl.length === 3, `(d) debounce: string 2 re-crossed within 10 ms plucks once (got ${n2} of ${pl.length} plucks)`);
+    }
+    // (g) a parked, jittering tip on a string line → 0 plucks (hysteresis)
+    {
+      const d = mk();
+      const y1 = ys[1];
+      let seed = 777;
+      const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+      d.push({ x: xIn, y: -0.10, t: 0 });                 // arrives armed from above …
+      const arrive = d.push({ x: xIn, y: y1, t: 33 });     // … and comes to rest on string 1 (legitimately crossing string 0)
+      check(arrive.length === 1 && arrive[0].string === 0, `(g) arriving on string 1 from above plucks only string 0 (got ${arrive.map(p => p.string).join()})`);
+      let pl = [];
+      for (let k = 2; k <= 60; k++) {                     // 2 s at 30 fps, ±5 px of jitter (0.007 u) about the line, still armed at first
+        pl = pl.concat(d.push({ x: xIn + (rnd() - 0.5) * 0.01, y: y1 + (rnd() - 0.5) * 0.014, t: k * 33 }));
+      }
+      check(pl.length === 0, `(g) tip resting on string 1 with ±0.007 jitter for 2 s → 0 plucks (got ${pl.length})`);
+      check(!d.isArmed(), `(g) loitering inside the string band disarms the stroke`);
+      // and a real stroke afterwards still works: leave the band, come back through
+      const after = [...d.push({ x: xIn, y: -0.12, t: 2100 }), ...d.push({ x: xIn, y: 0.00, t: 2140 }), ...d.push({ x: xIn, y: 0.12, t: 2180 })];
+      check(after.length === 4, `(g) next real stroke after resting plays 4 strings (got ${after.length})`);
+    }
+    // (h) fast teleport (role swap between hands): Δ = 0.3 u in 33 ms = 9 u/s > 2·V_MAX → 0 plucks
+    {
+      const d = mk();
+      const pl = [
+        ...d.push({ x: xIn, y: -0.15, t: 0 }),
+        ...d.push({ x: xIn, y: 0.15, t: 33 }),
+      ];
+      check(pl.length === 0, `(h) 0.3 u jump in 33 ms (9 u/s) is a glitch → 0 plucks (got ${pl.length})`);
+      const slow = mk();
+      const ok = [...slow.push({ x: xIn, y: -0.15, t: 0 }), ...slow.push({ x: xIn, y: 0.15, t: 60 })];
+      check(ok.length === 4, `(h) the same 0.3 u over 60 ms (5 u/s) is a real fast strum → 4 plucks (got ${ok.length})`);
+    }
+    // (i) tip appears from over the neck straight into the string band → not armed → 0 plucks
+    {
+      const d = mk();
+      const pl = [
+        ...d.push({ x: 0.30, y: -0.02, t: 0 }),          // over the neck, between strings 1 and 2
+        ...d.push({ x: 0.20, y: 0.05, t: 33 }),           // slides into the body zone across string 2 (3.7 u/s, no glitch)
+        ...d.push({ x: 0.20, y: 0.055, t: 66 }),
+      ];
+      check(pl.length === 0, `(i) entering the band from the neck without leaving it first → 0 plucks (got ${pl.length})`);
+    }
+    // (e) teleport → 0 plucks, no crash
+    {
+      const d = mk();
+      let pl, threw = false;
+      try {
+        pl = [
+          ...d.push({ x: xIn, y: -0.30, t: 0 }),
+          ...d.push({ x: xIn, y: 0.30, t: 33 }),
+        ];
+      } catch (e) { threw = true; pl = []; }
+      check(!threw && pl.length === 0, `(e) teleport Δy=0.6 → 0 plucks, no crash`);
+      // and detection resumes after the glitch
+      const after = [...d.push({ x: xIn, y: 0.15, t: 66 }), ...d.push({ x: xIn, y: -0.15, t: 120 })];
+      check(after.length === 4, `(e) detector resyncs after glitch (got ${after.length} plucks on next stroke)`);
+    }
+    // (f) UkeFrame round trip
+    {
+      const saved = UkeFrame.get();
+      UkeFrame.set({ bridge: { x: 0.68, y: 0.62 }, angleDeg: -15, length: 0.55, spacing, aspect: 1 });
+      let maxErr = 0;
+      let seed = 12345;
+      const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+      for (let k = 0; k < 200; k++) {
+        const p = { x: rnd() * 0.6 - 0.1, y: rnd() * 0.3 - 0.15 };
+        const q = UkeFrame.toLocal(UkeFrame.toScreen(p));
+        maxErr = Math.max(maxErr, Math.abs(q.x - p.x), Math.abs(q.y - p.y));
+      }
+      check(maxErr < 1e-9, `(f) toLocal(toScreen(p)) round trip max error ${maxErr.toExponential(2)}`);
+      const segs = UkeFrame.stringScreenSegments();
+      const lys = UkeFrame.stringLocalYs();
+      const midOk = segs.every((sg, i) => {
+        const m = UkeFrame.toLocal({ x: (sg.a.x + sg.b.x) / 2, y: (sg.a.y + sg.b.y) / 2 });
+        return Math.abs(m.y - lys[i]) < 1e-9 && Math.abs(m.x - 0.55 / 2) < 1e-9;
+      });
+      check(midOk, `(f) string segment midpoints map to local (L/2, y_i)`);
+      // aspect-corrected round trip too
+      UkeFrame.set({ aspect: 16 / 9 });
+      let err2 = 0;
+      for (let k = 0; k < 100; k++) {
+        const p = { x: rnd() * 0.6 - 0.1, y: rnd() * 0.3 - 0.15 };
+        const q = UkeFrame.toLocal(UkeFrame.toScreen(p));
+        err2 = Math.max(err2, Math.abs(q.x - p.x), Math.abs(q.y - p.y));
+      }
+      check(err2 < 1e-9, `(f) round trip with aspect 16:9 max error ${err2.toExponential(2)}`);
+      // recenter puts the tip inside the strum zone, above the top string on the armed side
+      const tip = { x: 0.7, y: 0.6 }, wrist = { x: 0.3, y: 0.5 };
+      UkeFrame.recenter(wrist, tip);
+      const lt = UkeFrame.toLocal(tip);
+      const [z0, z1] = UkeFrame.strumZone();
+      const wantY = UkeFrame.RECENTER_TIP_Y(spacing), topY = UkeFrame.stringLocalYs()[0];
+      check(Math.abs(lt.y - wantY) < 1e-9 && lt.y < topY - 0.3 * spacing && lt.x > z0 && lt.x < z1,
+        `(f) recenter(): tip at local (${lt.x.toFixed(3)}, ${lt.y.toFixed(3)}) inside zone [${z0.toFixed(3)}, ${z1.toFixed(3)}], clear of the top string (${topY.toFixed(3)})`);
+      const lw = UkeFrame.toLocal(wrist);
+      check(Math.abs(lw.y - wantY) < 1e-6 && lw.x > lt.x, `(f) recenter(): neck aims at wrist (wrist local y ${lw.y.toFixed(3)} = tip y)`);
+      // neck zone covers the drawn fretboard (0.46L..L, half-width 2·spacing) with margin
+      const nz = UkeFrame.neckZone();
+      check(nz.x0 < 0.46 * 0.55 && nz.x1 > 0.55 && nz.yHalf > 2 * spacing, `(f) neckZone [${nz.x0.toFixed(3)}, ${nz.x1.toFixed(3)}] ±${nz.yHalf.toFixed(3)} encloses the fretboard`);
+      UkeFrame.set(saved);
+    }
+
+    lines.unshift(pass ? 'V4 RAKE OK' : 'V4 RAKE FAILED');
+    return { pass, lines };
+  }
+
+  return { createDetector, schedule, keyboardStrum, velocityToAmp, V_MAX, selfTest };
+})();
+
+
+// ==========================================================================
+// SECTION annot/  (src/annot.js)
+// ==========================================================================
+// ============================================================================
+// annot/  — on-instrument chord annotations, hand glyph, right-hand help panel, V11
+// ----------------------------------------------------------------------------
+// Depends on globals Tuning (CHORDS, CHORD_ORDER, FINGERING, CURL_RULE, OPEN_NAMES)
+// and UkeFrame (get, toScreen, stringLocalYs). Drawn right after UkeFrame.draw.
+// Fret n sits at local x = L·2^(−n/12) — identical to UkeFrame.draw — so finger
+// dots land in the fret space between fret f−1 and fret f (nut = fret 0 at x = L).
+// All canvas work is guarded; selfTest() is pure apart from a stub ctx smoke test.
+// ============================================================================
+const Annot = (() => {
+  const FINGER_NAMES = ['index', 'middle', 'ring', 'pinky'];
+  const KEYS = { C: 'Q', G: 'W', Am: 'E', F: 'R', open: 'O', mute: 'fist' };
+  const HELP_ORDER = () => [...Tuning.CHORD_ORDER, 'open', 'mute'];
+  const COLORS = {
+    dot: '#ffb74d', dotText: '#1a1a1a', text: 'rgba(255,255,255,0.88)', dim: 'rgba(255,255,255,0.6)',
+    ok: '#37d67a', warn: '#ffb74d', string: 'rgba(255,255,255,0.35)', mute: 'rgba(255,92,92,0.95)',
+  };
+
+  // ------------------------------------------------------------ geometry helpers
+  // Fret line n (0 = nut) measured from the bridge along the neck.
+  const fretX = (n, L) => L * Math.pow(2, -n / 12);
+  // Centre of the fret space for fret f: midway between fret lines f−1 and f.
+  const fretSpaceX = (f, L) => 0.5 * (fretX(f - 1, L) + fretX(f, L));
+
+  function isCtx(ctx) {
+    return !!ctx && typeof ctx.beginPath === 'function' && typeof ctx.arc === 'function';
+  }
+
+  // ------------------------------------------------------------ position layer (pure)
+  // Where each finger of `chord` must be, in instrument-local units, for scale length L and
+  // string spacing s. drawInstrument draws exactly these, so the coaching target and the dot
+  // on screen are the same number by construction (V11 asserts it).
+  function dotTargets(chord, L, s) {
+    const fingering = Tuning.FINGERING[chord] || [];
+    return fingering.map(d => ({ finger: d.finger, s: d.s, f: d.f,
+                                  local: { x: fretSpaceX(d.f, L), y: (d.s - 1.5) * s } }));
+  }
+  // How far a fingertip may sit from its dot and still count. Fret spaces are only ~0.03 frame-
+  // heights wide and a fingertip on camera is about that size, so the tolerance is most of a cell:
+  // 0.8 of the fret space along the neck, 0.75 of the string spacing across it.
+  const TOL_X_FRAC = 0.8, TOL_Y_FRAC = 0.75;
+  function fingerTolerance(f, L, s) {
+    return { tolX: TOL_X_FRAC * (fretX(f - 1, L) - fretX(f, L)), tolY: TOL_Y_FRAC * s };
+  }
+  // tips: array indexed by finger number 1..4 (index, middle, ring, pinky) of local {x,y} or null.
+  // Returns per-dot offsets (dx,dy in local units, dn = normalised distance, ok = dn ≤ 1),
+  // allOk and a 0..1 score. A chord with no dots (open, mute) is trivially in position.
+  function matchFingers(chord, tips, L, s) {
+    const dots = dotTargets(chord, L, s).map(d => {
+      const tip = tips && tips[d.finger];
+      if (!tip || !Number.isFinite(tip.x) || !Number.isFinite(tip.y)) return { ...d, tip: null, dx: NaN, dy: NaN, dn: Infinity, ok: false };
+      const { tolX, tolY } = fingerTolerance(d.f, L, s);
+      const dx = tip.x - d.local.x, dy = tip.y - d.local.y;
+      const dn = Math.hypot(dx / tolX, dy / tolY);
+      return { ...d, tip, dx, dy, dn, ok: dn <= 1 };
+    });
+    const allOk = dots.every(d => d.ok);
+    const score = dots.length ? dots.reduce((a, d) => a + Math.max(0, Math.min(1, 1 - d.dn / 2)), 0) / dots.length : 1;
+    return { dots, allOk, score };
+  }
+  // The fretting hand is "over the neck" when at least two fingertips are inside the neck zone
+  // ({x0, x1, yHalf} in local units — see UkeFrame.neckZone). Two, not four: curled fingers' tips
+  // sit over the palm and can fall just outside the board while the hand is clearly on it.
+  const OVER_NECK_MIN_TIPS = 2;
+  function handOverNeck(tips, zone) {
+    if (!tips || !zone) return false;
+    let n = 0;
+    for (const t of tips) {
+      if (!t || !Number.isFinite(t.x) || !Number.isFinite(t.y)) continue;
+      if (t.x >= zone.x0 && t.x <= zone.x1 && Math.abs(t.y) <= zone.yHalf) n++;
+    }
+    return n >= OVER_NECK_MIN_TIPS;
+  }
+  // Human hint for one dot: which way to move that finger. Local +x runs toward the nut.
+  function hintFor(d, L, s) {
+    if (!d.tip) return `finger ${d.finger}: not seen`;
+    const { tolX, tolY } = fingerTolerance(d.f, L, s);
+    const parts = [];
+    if (Math.abs(d.dy) > tolY) parts.push(d.dy > 0 ? 'up one string' : 'down one string');
+    if (Math.abs(d.dx) > tolX) parts.push(d.dx > 0 ? 'toward the body' : 'toward the nut');
+    return `finger ${d.finger}: ${parts.join(', ') || 'almost — hold'}`;
+  }
+
+  // Pixel-space view of the current frame: P(local) → [px, py]; spacingPx from
+  // two adjacent strings so it is right whatever aspect handling is in force.
+  function view(w, h) {
+    const fr = UkeFrame.get();
+    const ys = UkeFrame.stringLocalYs();
+    const P = l => { const q = UkeFrame.toScreen(l); return [q.x * w, q.y * h]; };
+    const [ax, ay] = P({ x: fr.length / 2, y: ys[0] });
+    const [bx, by] = P({ x: fr.length / 2, y: ys[1] });
+    const spacingPx = Math.max(1, Math.hypot(bx - ax, by - ay));
+    return { L: fr.length, s: fr.spacing, ys, P, spacingPx };
+  }
+
+  // Capsule (stadium) path between two points with radius r — lets us both fill
+  // and outline, which round-capped strokes cannot do.
+  function capsulePath(ctx, x0, y0, x1, y1, r) {
+    const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;              // left normal
+    const a = Math.atan2(dy, dx);
+    ctx.beginPath();
+    ctx.moveTo(x0 + nx * r, y0 + ny * r);
+    ctx.lineTo(x1 + nx * r, y1 + ny * r);
+    ctx.arc(x1, y1, r, a - Math.PI / 2, a + Math.PI / 2, false);
+    ctx.lineTo(x0 - nx * r, y0 - ny * r);
+    ctx.arc(x0, y0, r, a + Math.PI / 2, a + 3 * Math.PI / 2, false);
+    ctx.closePath();
+  }
+
+  function text(ctx, str, x, y, px, color, align = 'center', baseline = 'middle', weight = '') {
+    ctx.font = `${weight ? weight + ' ' : ''}${Math.max(8, px).toFixed(1)}px system-ui, "Segoe UI", sans-serif`;
+    ctx.fillStyle = color;
+    ctx.textAlign = align;
+    ctx.textBaseline = baseline;
+    ctx.fillText(str, x, y);
+  }
+
+  // ------------------------------------------------------------ PART A
+  function drawInstrument(ctx, w, h, opts = {}) {
+    if (!isCtx(ctx)) return;
+    const chord = opts.chord;
+    if (chord == null || !Tuning.CHORDS[chord]) return;
+    const recognised = opts.recognised;
+    const fingering = Tuning.FINGERING[chord] || [];
+    const rule = Tuning.CURL_RULE[chord] || { fingers: [], text: '' };
+    const { L, s, ys, P, spacingPx } = view(w, h);
+    const nw = 2.0 * s;                                // neck half-width, as in UkeFrame.draw
+    const isMute = chord === 'mute';
+
+    ctx.save();
+    ctx.lineJoin = 'round';
+
+    // 4. Sounding strings — thin bright overlay (all four sound on a uke; muted strings are damped)
+    if (!isMute) {
+      ctx.strokeStyle = COLORS.string;
+      ctx.lineWidth = Math.max(1, 0.05 * spacingPx);
+      ys.forEach(y => {
+        const [x0, y0] = P({ x: 0, y }), [x1, y1] = P({ x: L, y });
+        ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      });
+    }
+
+    // 1. String names just past the bridge (tail side) so they never collide with the headstock tuners
+    ys.forEach((y, i) => {
+      const [x, yy] = P({ x: -0.8 * s, y });
+      text(ctx, Tuning.OPEN_NAMES[i][0], x, yy, 0.55 * spacingPx, COLORS.dim, 'center', 'middle', '600');
+    });
+
+    // 2. Fret numbers 1–4 centred in the fret space, below the neck
+    for (let f = 1; f <= 4; f++) {
+      const [x, y] = P({ x: fretSpaceX(f, L), y: nw + 0.8 * s });
+      text(ctx, String(f), x, y, 0.55 * spacingPx, COLORS.dim);
+    }
+
+    // 3. Finger dots / open markers / mute crosses
+    const dotted = new Set(fingering.map(d => d.s));
+    const r = 0.42 * spacingPx;
+    dotTargets(chord, L, s).forEach(d => {
+      const [x, y] = P(d.local);
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI);
+      ctx.fillStyle = COLORS.dot; ctx.fill();
+      ctx.lineWidth = Math.max(1, 0.06 * spacingPx); ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.stroke();
+      text(ctx, String(d.finger), x, y + 0.02 * spacingPx, 0.6 * spacingPx, COLORS.dotText, 'center', 'middle', '700');
+    });
+    ys.forEach((y, i) => {
+      const [x, yy] = P({ x: L + 0.32 * s, y });
+      if (isMute) {
+        const k = 0.2 * spacingPx;
+        ctx.strokeStyle = COLORS.mute; ctx.lineWidth = Math.max(1, 0.1 * spacingPx);
+        ctx.beginPath(); ctx.moveTo(x - k, yy - k); ctx.lineTo(x + k, yy + k);
+        ctx.moveTo(x - k, yy + k); ctx.lineTo(x + k, yy - k); ctx.stroke();
+      } else if (!dotted.has(i)) {
+        ctx.beginPath(); ctx.arc(x, yy, 0.2 * spacingPx, 0, 2 * Math.PI);
+        ctx.strokeStyle = COLORS.text; ctx.lineWidth = Math.max(1, 0.07 * spacingPx); ctx.stroke();
+      }
+    });
+
+    // 5. Hand glyph above the neck near the nut, screen-aligned for readability
+    drawHandGlyph(ctx, P({ x: 0.78 * L, y: -(nw + 2.6 * s) }), 1.0 * spacingPx, rule, chord, recognised, opts.position);
+
+    ctx.restore();
+  }
+
+  // Finger indicator: four vertical pills (index → pinky), short and filled when the finger should
+  // be curled, tall and outlined when it should stay straight. Reads at a glance and matches the HUD.
+  // `position` (optional): 'ok' | 'off' | 'away' — the position layer's verdict for the fretting hand.
+  function drawHandGlyph(ctx, [cx, cy], g, rule, chord, recognised, position) {
+    const shapeOk = recognised == null || recognised === chord;
+    const match = shapeOk && position !== 'off' && position !== 'away';
+    const col = match ? COLORS.ok : COLORS.warn;
+    const folded = new Set(rule.fingers || []);
+    const pillW = 0.55 * g, gap = 0.35 * g, tall = 1.7 * g, short = 0.85 * g, r = pillW / 2;
+    const totalW = 4 * pillW + 3 * gap;
+    const base = cy + 0.6 * g;                            // pills stand on a common baseline
+    ctx.save();
+    // Soft plate behind the indicator
+    const padX = 0.7 * g, plateTop = base - tall - 0.5 * g, plateH = tall + 1.9 * g;
+    roundRect(ctx, cx - totalW / 2 - padX, plateTop, totalW + 2 * padX, plateH, 0.5 * g);
+    ctx.fillStyle = 'rgba(8,10,14,0.55)'; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.stroke();
+    // Pills
+    ctx.lineWidth = Math.max(1, 0.08 * g);
+    const letters = ['i', 'm', 'r', 'p'];
+    FINGER_NAMES.forEach((name, k) => {
+      const x = cx - totalW / 2 + k * (pillW + gap);
+      const hgt = folded.has(name) ? short : tall;
+      roundRect(ctx, x, base - hgt, pillW, hgt, r);
+      if (folded.has(name)) { ctx.fillStyle = col; ctx.fill(); }
+      else { ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fill(); ctx.strokeStyle = col; ctx.stroke(); }
+      text(ctx, letters[k], x + pillW / 2, base + 0.32 * g, 0.36 * g, COLORS.dim, 'center', 'middle', '600');
+    });
+    // Labels
+    text(ctx, rule.text || '', cx, base + 0.95 * g, 0.42 * g, COLORS.text);
+    if (!shapeOk) text(ctx, `seeing: ${recognised}`, cx, base + 1.45 * g, 0.4 * g, COLORS.warn);
+    else if (position === 'away') text(ctx, 'left hand: onto the fretboard', cx, base + 1.45 * g, 0.4 * g, COLORS.warn);
+    else if (position === 'off') text(ctx, 'fingers: onto the dots', cx, base + 1.45 * g, 0.4 * g, COLORS.warn);
+    ctx.restore();
+  }
+
+  // Coaching overlay, drawn after drawInstrument. Shows the live fretting fingertips as numbered
+  // rings; a finger off its dot gets an arrow to the dot and a text hint, a finger on its dot
+  // turns green. When the hand is not over the neck at all, one arrow leads the hand centroid
+  // to the middle of the fretboard. Only fingers the chord uses are annotated.
+  //   opts: { chord, match (from matchFingers), tips [1..4] local, overNeck, handCentre local|null }
+  function drawCoaching(ctx, w, h, opts = {}) {
+    if (!isCtx(ctx)) return;
+    const chord = opts.chord;
+    if (chord == null || !Tuning.CHORDS[chord]) return;
+    const { L, s, P, spacingPx } = view(w, h);
+    const g = spacingPx;
+    ctx.save();
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+
+    const arrow = (x0, y0, x1, y1, col) => {
+      const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
+      if (len < 0.3 * g) return;
+      const ux = dx / len, uy = dy / len, head = 0.35 * g;
+      const ex = x1 - ux * 0.5 * g, ey = y1 - uy * 0.5 * g;   // stop short of the dot
+      ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = Math.max(1.5, 0.09 * g);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - ux * head - uy * 0.5 * head, ey - uy * head + ux * 0.5 * head);
+      ctx.lineTo(ex - ux * head + uy * 0.5 * head, ey - uy * head - ux * 0.5 * head);
+      ctx.closePath(); ctx.fill();
+    };
+
+    if (opts.overNeck === false && opts.handCentre) {
+      const [hx, hy] = P(opts.handCentre), [nx, ny] = P({ x: 0.73 * L, y: 0 });
+      arrow(hx, hy, nx, ny, COLORS.warn);
+      text(ctx, 'move your left hand onto the fretboard', nx, ny - 3.2 * g, 0.55 * g, COLORS.warn, 'center', 'middle', '600');
+      ctx.restore();
+      return;
+    }
+
+    const m = opts.match;
+    if (!m || !m.dots.length) { ctx.restore(); return; }
+    const hints = [];
+    m.dots.forEach(d => {
+      const [tx, ty] = P(d.local);
+      const col = d.ok ? COLORS.ok : COLORS.warn;
+      if (d.ok) {                                            // filled green confirmation over the dot
+        ctx.beginPath(); ctx.arc(tx, ty, 0.5 * g, 0, 2 * Math.PI);
+        ctx.strokeStyle = col; ctx.lineWidth = Math.max(1.5, 0.1 * g); ctx.stroke();
+      }
+      if (d.tip) {                                           // live fingertip ring with the finger number
+        const [fx, fy] = P(d.tip);
+        ctx.beginPath(); ctx.arc(fx, fy, 0.38 * g, 0, 2 * Math.PI);
+        ctx.strokeStyle = col; ctx.lineWidth = Math.max(1.5, 0.1 * g); ctx.stroke();
+        text(ctx, String(d.finger), fx, fy + 0.02 * g, 0.5 * g, col, 'center', 'middle', '700');
+        if (!d.ok) arrow(fx, fy, tx, ty, col);
+      }
+      if (!d.ok) hints.push(hintFor(d, L, s));
+    });
+    if (hints.length) {
+      const [hx, hy] = P({ x: 0.73 * L, y: 2 * s + 2.4 * s });   // under the fret numbers
+      hints.slice(0, 3).forEach((t, k) => text(ctx, t, hx, hy + k * 0.62 * g, 0.5 * g, COLORS.warn, 'center', 'middle', '600'));
+    }
+    ctx.restore();
+  }
+  function roundRect(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r); ctx.closePath();
+  }
+
+  // ------------------------------------------------------------ PART B
+  const HELP_CSS = `
+#help h3{margin:0 0 8px;font:600 15px system-ui,sans-serif;color:#f4f4f4;letter-spacing:.3px}
+#help .hrow{display:flex;align-items:center;gap:10px;padding:6px 8px;margin:4px 0;border-radius:8px;border:1.5px solid transparent;border-left:4px solid transparent;background:rgba(255,255,255,.04)}
+#help .hrow.seen{border-color:#37d67a;background:rgba(55,214,122,.10)}
+#help .hrow.target{border-left-color:#ffb74d}
+#help .hrow canvas{width:64px;height:80px;flex:0 0 64px}
+#help .hname{font:700 20px system-ui,sans-serif;color:#f4f4f4;display:flex;align-items:baseline;gap:8px}
+#help .hkey{font:600 11px ui-monospace,Consolas,monospace;color:#000;background:#ffb74d;border-radius:4px;padding:1px 6px}
+#help .hrule{font:13px system-ui,sans-serif;color:rgba(255,255,255,.7);margin-top:2px}
+#help .hfoot{font:12px system-ui,sans-serif;color:rgba(255,255,255,.55);margin-top:10px;line-height:1.5}
+`;
+
+  function ensureStyle() {
+    if (typeof document === 'undefined' || document.getElementById('annot-style')) return;
+    const st = document.createElement('style');
+    st.id = 'annot-style';
+    st.textContent = HELP_CSS;
+    document.head.appendChild(st);
+  }
+
+  // 64×80 CSS px diagram, drawn at 2× for crispness. Strings vertical (G leftmost), nut at top.
+  function drawMiniDiagram(canvas, chord) {
+    const ctx = canvas.getContext && canvas.getContext('2d');
+    if (!isCtx(ctx)) return;
+    const S = 2;
+    canvas.width = 64 * S; canvas.height = 80 * S;
+    ctx.save(); ctx.scale(S, S);
+    ctx.clearRect(0, 0, 64, 80);
+    const xs = [13, 26, 39, 52], nutY = 14, fh = 13;
+    const isMute = chord === 'mute';
+    const fingering = Tuning.FINGERING[chord] || [];
+    const dotted = new Set(fingering.map(d => d.s));
+    // fret lines
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1;
+    for (let k = 1; k <= 4; k++) { ctx.beginPath(); ctx.moveTo(xs[0], nutY + fh * k); ctx.lineTo(xs[3], nutY + fh * k); ctx.stroke(); }
+    // strings
+    ctx.strokeStyle = 'rgba(255,255,255,.75)';
+    xs.forEach(x => { ctx.beginPath(); ctx.moveTo(x, nutY); ctx.lineTo(x, nutY + fh * 4); ctx.stroke(); });
+    // nut
+    ctx.strokeStyle = '#f4f4f4'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(xs[0] - 1, nutY); ctx.lineTo(xs[3] + 1, nutY); ctx.stroke();
+    // dots
+    fingering.forEach(d => {
+      const x = xs[d.s], y = nutY + fh * (d.f - 1) + fh / 2;
+      ctx.beginPath(); ctx.arc(x, y, 5.2, 0, 2 * Math.PI); ctx.fillStyle = COLORS.dot; ctx.fill();
+      text(ctx, String(d.finger), x, y + 0.5, 8, COLORS.dotText, 'center', 'middle', '700');
+    });
+    // open / mute markers above the nut
+    xs.forEach((x, i) => {
+      if (isMute) {
+        ctx.strokeStyle = COLORS.mute; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(x - 3, 5); ctx.lineTo(x + 3, 11); ctx.moveTo(x - 3, 11); ctx.lineTo(x + 3, 5); ctx.stroke();
+      } else if (!dotted.has(i)) {
+        ctx.beginPath(); ctx.arc(x, 8, 3, 0, 2 * Math.PI); ctx.strokeStyle = COLORS.text; ctx.lineWidth = 1.2; ctx.stroke();
+      }
+    });
+    // string names
+    xs.forEach((x, i) => text(ctx, Tuning.OPEN_NAMES[i][0], x, 74, 8, COLORS.dim));
+    ctx.restore();
+  }
+
+  function renderHelp(container, opts = {}) {
+    if (!container || typeof document === 'undefined') return;
+    ensureStyle();
+    if (!container.dataset.annotBuilt) {
+      container.innerHTML = '';
+      const h3 = document.createElement('h3'); h3.textContent = 'Chords'; container.appendChild(h3);
+      HELP_ORDER().forEach(chord => {
+        const row = document.createElement('div');
+        row.className = 'hrow'; row.dataset.chord = chord;
+        const cv = document.createElement('canvas');
+        drawMiniDiagram(cv, chord);
+        const info = document.createElement('div'); info.className = 'hinfo';
+        const name = document.createElement('div'); name.className = 'hname';
+        name.textContent = chord;
+        const key = document.createElement('span'); key.className = 'hkey'; key.textContent = KEYS[chord] || '';
+        name.appendChild(key);
+        const ruleEl = document.createElement('div'); ruleEl.className = 'hrule';
+        ruleEl.textContent = (Tuning.CURL_RULE[chord] || {}).text || '';
+        info.appendChild(name); info.appendChild(ruleEl);
+        row.appendChild(cv); row.appendChild(info);
+        container.appendChild(row);
+      });
+      const foot = document.createElement('div'); foot.className = 'hfoot';
+      foot.textContent = 'Right hand: sweep the index finger across the strings · B: click the blue cap to anchor · S: song · ?: hide';
+      container.appendChild(foot);
+      container.dataset.annotBuilt = '1';
+    }
+    const rows = container.querySelectorAll('.hrow');
+    rows.forEach(row => {
+      const c = row.dataset.chord;
+      row.classList.toggle('seen', c === opts.recognised);
+      row.classList.toggle('target', c === opts.target);
+    });
+  }
+
+  // ------------------------------------------------------------ PART C (V11)
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push(`${ok ? 'PASS' : 'FAIL'} ${msg}`); };
+
+    // (a) fingering ↔ chord table consistency
+    for (const chord of Tuning.CHORD_ORDER) {
+      const frets = Tuning.CHORDS[chord], dots = Tuning.FINGERING[chord];
+      check(Array.isArray(dots), `(a) ${chord} has a FINGERING entry`);
+      if (!Array.isArray(dots)) continue;
+      const dotOk = dots.every(d => d.s >= 0 && d.s < 4 && frets[d.s] === d.f);
+      check(dotOk, `(a) ${chord}: every dot sits on its chord fret (${dots.map(d => `s${d.s}f${d.f}`).join(' ')})`);
+      const nonzero = frets.map((f, s) => (f > 0 ? s : -1)).filter(s => s >= 0);
+      const oneEach = nonzero.every(s => dots.filter(d => d.s === s).length === 1) && dots.length === nonzero.length;
+      check(oneEach, `(a) ${chord}: exactly one dot per fretted string (${nonzero.length} fretted, ${dots.length} dots)`);
+      // (b) finger numbers 1–4, unique
+      const fingers = dots.map(d => d.finger);
+      check(fingers.every(n => Number.isInteger(n) && n >= 1 && n <= 4) && new Set(fingers).size === fingers.length,
+        `(b) ${chord}: finger numbers valid and unique (${fingers.join(',') || 'none'})`);
+    }
+    // (c) curl rule for every chord incl. open/mute
+    for (const chord of HELP_ORDER()) {
+      const r = Tuning.CURL_RULE[chord];
+      const ok = !!r && Array.isArray(r.fingers) && r.fingers.every(f => FINGER_NAMES.includes(f)) && typeof r.text === 'string';
+      check(ok, `(c) ${chord}: CURL_RULE present (${r ? r.fingers.join('+') || 'none' : 'missing'})`);
+    }
+    // (d) fret-space centres lie strictly between fret lines, matching UkeFrame's L·2^(−n/12)
+    const L = 0.55;
+    for (let f = 1; f <= 4; f++) {
+      const x = fretSpaceX(f, L), hi = fretX(f - 1, L), lo = fretX(f, L);
+      check(x > lo && x < hi, `(d) fret space ${f}: ${x.toFixed(4)} strictly between fret ${f} (${lo.toFixed(4)}) and fret ${f - 1} (${hi.toFixed(4)})`);
+    }
+    check(Math.abs(fretX(0, L) - L) < 1e-12, `(d) fret 0 is the nut at x = L`);
+    // (e) smoke: drawInstrument runs without throwing for every chord on a recording stub ctx
+    {
+      const calls = [];
+      const stub = new Proxy({}, {
+        get(_, prop) { return (...args) => { calls.push(String(prop)); return undefined; }; },
+        set() { return true; },
+      });
+      let threw = null;
+      try {
+        for (const chord of HELP_ORDER()) drawInstrument(stub, 1920, 1080, { chord, recognised: chord === 'C' ? 'G' : chord });
+        drawInstrument(stub, 1920, 1080, { chord: null });
+        drawInstrument(null, 1920, 1080, { chord: 'C' });
+      } catch (e) { threw = e; }
+      check(!threw, `(e) drawInstrument smoke test over ${HELP_ORDER().length} chords (${calls.length} ctx calls)${threw ? ' — ' + threw.message : ''}`);
+    }
+    // (f) position layer: dot targets agree with the fret table and sit in their fret space on their string
+    const s = 0.045;
+    for (const chord of Tuning.CHORD_ORDER) {
+      const dots = dotTargets(chord, L, s), fing = Tuning.FINGERING[chord];
+      const geomOk = dots.length === fing.length && dots.every(d =>
+        d.local.x > fretX(d.f, L) && d.local.x < fretX(d.f - 1, L) && Math.abs(d.local.y - (d.s - 1.5) * s) < 1e-12);
+      check(geomOk, `(f) ${chord}: ${dots.length} dot target(s) inside fret space on the right string`);
+    }
+    // (g) a synthetic hand exactly on the dots matches; one string off does not; a hand over the body is not on the neck
+    {
+      const tipsOn = chord => { const t = [null, null, null, null, null]; dotTargets(chord, L, s).forEach(d => { t[d.finger] = { ...d.local }; }); return t; };
+      const zone = { x0: 0.40 * L, x1: 1.08 * L, yHalf: 4 * s };
+      for (const chord of Tuning.CHORD_ORDER) {
+        const on = matchFingers(chord, tipsOn(chord), L, s);
+        check(on.allOk && on.dots.every(d => d.dn < 1e-9) && on.score === 1, `(g) ${chord}: fingertips on the dots → in position (score ${on.score.toFixed(2)})`);
+        const shifted = tipsOn(chord).map(t => (t ? { x: t.x, y: t.y + s } : t));        // every finger one string too low
+        const off = matchFingers(chord, shifted, L, s);
+        check(!off.allOk && off.dots.every(d => d.dn > 1), `(g) ${chord}: one string off → not in position (dn ${off.dots.map(d => d.dn.toFixed(2)).join(',')})`);
+        const nearly = tipsOn(chord).map(t => (t ? { x: t.x, y: t.y + 0.5 * TOL_Y_FRAC * s } : t)); // half the tolerance
+        check(matchFingers(chord, nearly, L, s).allOk, `(g) ${chord}: within half a tolerance still counts`);
+        const missing = matchFingers(chord, [null, null, null, null, null], L, s);
+        check(!missing.allOk, `(g) ${chord}: no fingertips seen → not in position`);
+        check(hintFor(off.dots[0], L, s).includes('up one string'), `(g) ${chord}: hint for a finger one string too low says "up one string" (${hintFor(off.dots[0], L, s)})`);
+      }
+      check(matchFingers('open', [null, null, null, null, null], L, s).allOk, `(g) open: no dots → trivially in position`);
+      const onNeck = [{ x: 0.7 * L, y: 0 }, { x: 0.75 * L, y: s }, { x: 0.8 * L, y: -s }, { x: 0.85 * L, y: 2 * s }];
+      check(handOverNeck(onNeck, zone), `(g) four tips over the fretboard → hand over neck`);
+      const onBody = onNeck.map(t => ({ x: t.x - 0.5 * L, y: t.y }));
+      check(!handOverNeck(onBody, zone), `(g) tips shifted half a scale length toward the bridge → not over neck`);
+      check(handOverNeck([onNeck[0], onNeck[1], null, { x: 2 * L, y: 0 }], zone), `(g) two of four tips over the neck is enough`);
+      check(!handOverNeck([onNeck[0], null, null, null], zone), `(g) one tip over the neck is not enough`);
+    }
+    // (h) smoke: drawCoaching runs on the stub for every chord, in every position state
+    {
+      const stub = new Proxy({}, { get(_, prop) { return () => undefined; }, set() { return true; } });
+      let threw = null;
+      try {
+        for (const chord of HELP_ORDER()) {
+          const tips = [null, { x: 0.7 * L, y: 0 }, { x: 0.75 * L, y: s }, { x: 0.8 * L, y: -s }, { x: 0.85 * L, y: 2 * s }];
+          drawCoaching(stub, 1920, 1080, { chord, match: matchFingers(chord, tips, L, s), tips, overNeck: true });
+          drawCoaching(stub, 1920, 1080, { chord, match: null, tips, overNeck: false, handCentre: { x: 0.2 * L, y: 0 } });
+          drawInstrument(stub, 1920, 1080, { chord, recognised: chord, position: 'off' });
+          drawInstrument(stub, 1920, 1080, { chord, recognised: chord, position: 'away' });
+        }
+        drawCoaching(stub, 1920, 1080, { chord: null });
+        drawCoaching(null, 1920, 1080, { chord: 'C' });
+      } catch (e) { threw = e; }
+      check(!threw, `(h) drawCoaching smoke test${threw ? ' — ' + threw.message : ''}`);
+    }
+
+    lines.unshift(pass ? 'V11 ANNOTATIONS OK' : 'V11 ANNOTATIONS FAILED');
+    return { pass, lines };
+  }
+
+  return { drawInstrument, drawCoaching, renderHelp, drawMiniDiagram, fretX, fretSpaceX,
+           dotTargets, fingerTolerance, matchFingers, handOverNeck, hintFor, KEYS, selfTest };
+})();
+
+
+// ==========================================================================
+// SECTION anchor/  (src/anchor.js)
+// ==========================================================================
+// ============================================================================
+// anchor/  — blue-pen-cap body anchor. The instrument follows the cap on the
+// player's T-shirt: position AND size. The user clicks the cap once to sample
+// its colour. Detection maths are pure functions over an ImageData-like
+// {data, width, height} so they run in node; only sampleFrame touches the DOM.
+// ============================================================================
+const Anchor = (() => {
+  const params = {
+    hueTol: 18,        // degrees of circular hue distance accepted around the target; blue ink varies ±15° under mixed lighting
+    satMin: 0.35,      // below this a pixel is grey/white (T-shirt, wall), never the cap
+    valMin: 0.2,       // below this it is shadow; hue is unreliable in the dark
+    minAreaFrac: 0.0004, // 160×90 → 5.8 px: rejects specks and blue sensor noise
+    maxAreaFrac: 0.02,   // 160×90 → 288 px: rejects jeans, blue walls, blue shirts
+    smooth: 0.15,      // EMA alpha per update; ~6 frames to settle, kills jitter without visible lag
+    lostMs: 1000,      // after this long unseen the integrator freezes the instrument in place
+    scanW: 160,        // scan resolution; 160×90 keeps mask+blobs well under 3 ms
+    scanH: 90,
+  };
+
+  const STORE_KEY = 'uke.anchor.v1';
+  const DEFAULT_TARGET = { h: 220, s: 0.7, v: 0.6 };   // generic blue pen cap before the user samples
+  let target = { ...DEFAULT_TARGET };
+
+  // R_REF: a pen cap seen at arm's length on a 640×480 webcam is ~12 px tall in a 480 px frame
+  // ≈ 2.5% of frame height. r/R_REF = 1 means "the size we designed the default instrument for".
+  const R_REF = 0.025;
+
+  // -------------------------------------------------------------- colour
+  function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    let h = 0;
+    if (d > 0) {
+      if (max === r) h = 60 * (((g - b) / d) % 6);
+      else if (max === g) h = 60 * ((b - r) / d + 2);
+      else h = 60 * ((r - g) / d + 4);
+      if (h < 0) h += 360;
+    }
+    return { h, s: max > 0 ? d / max : 0, v: max };
+  }
+  function hueDiff(a, b) {
+    const d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  // -------------------------------------------------------------- target colour
+  function setTarget(t) { target = { h: +t.h, s: +t.s, v: +t.v }; }
+  function getTarget() { return { ...target }; }
+  function save() {
+    if (typeof localStorage === 'undefined') return false;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(target)); return true; } catch (e) { return false; }
+  }
+  function load() {
+    if (typeof localStorage === 'undefined') return false;
+    try {
+      const s = localStorage.getItem(STORE_KEY);
+      if (!s) return false;
+      const t = JSON.parse(s);
+      if (typeof t.h === 'number' && typeof t.s === 'number' && typeof t.v === 'number') { setTarget(t); return true; }
+    } catch (e) { }
+    return false;
+  }
+  // Average HSV of a (2r+1)² patch. (nx, ny) are MIRRORED normalized screen coords, so un-mirror x.
+  function sampleColorAt(img, nx, ny, radius) {
+    radius = radius == null ? 2 : radius;
+    const W = img.width, H = img.height, d = img.data;
+    const px = Math.round((1 - nx) * (W - 1)), py = Math.round(ny * (H - 1));
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let y = Math.max(0, py - radius); y <= Math.min(H - 1, py + radius); y++)
+      for (let x = Math.max(0, px - radius); x <= Math.min(W - 1, px + radius); x++) {
+        const i = 4 * (y * W + x);
+        r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+      }
+    if (!n) return null;
+    return rgbToHsv(r / n, g / n, b / n);
+  }
+
+  // -------------------------------------------------------------- frame capture (DOM only here)
+  let scanCanvas = null, scanCtx = null;
+  function sampleFrame(videoEl, scanW, scanH) {
+    scanW = scanW || params.scanW; scanH = scanH || params.scanH;
+    if (!videoEl || videoEl.readyState < 2) return null;
+    if (!scanCanvas || scanCanvas.width !== scanW || scanCanvas.height !== scanH) {
+      scanCanvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(scanW, scanH) : document.createElement('canvas');
+      scanCanvas.width = scanW; scanCanvas.height = scanH;
+      scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    scanCtx.drawImage(videoEl, 0, 0, scanW, scanH);   // not mirrored; coordinates are mirrored later
+    return scanCtx.getImageData(0, 0, scanW, scanH);
+  }
+
+  // -------------------------------------------------------------- mask + blobs (pure)
+  function mask(img, tgt, p) {
+    tgt = tgt || target; p = p || params;
+    const W = img.width, H = img.height, d = img.data;
+    const out = new Uint8Array(W * H);
+    for (let i = 0, j = 0; i < W * H; i++, j += 4) {
+      const c = rgbToHsv(d[j], d[j + 1], d[j + 2]);
+      if (c.s >= p.satMin && c.v >= p.valMin && hueDiff(c.h, tgt.h) <= p.hueTol) out[i] = 1;
+    }
+    return out;
+  }
+
+  // Connected components, 4-neighbour, iterative flood fill with an explicit stack (no recursion).
+  function blobs(m, W, H, p) {
+    p = p || params;
+    const minA = p.minAreaFrac * W * H, maxA = p.maxAreaFrac * W * H;
+    const seen = new Uint8Array(W * H);
+    const stack = new Int32Array(W * H);
+    const out = [];
+    for (let s = 0; s < W * H; s++) {
+      if (!m[s] || seen[s]) continue;
+      let sp = 0, area = 0, sx = 0, sy = 0;
+      stack[sp++] = s; seen[s] = 1;
+      while (sp > 0) {
+        const i = stack[--sp];
+        const x = i % W, y = (i - x) / W;
+        area++; sx += x; sy += y;
+        if (x > 0     && m[i - 1] && !seen[i - 1]) { seen[i - 1] = 1; stack[sp++] = i - 1; }
+        if (x < W - 1 && m[i + 1] && !seen[i + 1]) { seen[i + 1] = 1; stack[sp++] = i + 1; }
+        if (y > 0     && m[i - W] && !seen[i - W]) { seen[i - W] = 1; stack[sp++] = i - W; }
+        if (y < H - 1 && m[i + W] && !seen[i + W]) { seen[i + W] = 1; stack[sp++] = i + W; }
+      }
+      if (area < minA || area > maxA) continue;
+      out.push({ cx: sx / area, cy: sy / area, area, r: Math.sqrt(area / Math.PI) });
+    }
+    out.sort((a, b) => b.area - a.area);
+    return out;
+  }
+
+  // prev = {cx, cy} in pixels. Prefer the blob nearest to prev within 25% of the width; else the largest.
+  function pick(list, prev, W) {
+    if (!list.length) return null;
+    if (prev && W) {
+      let best = null, bd = 0.25 * W;
+      for (const b of list) {
+        const d = Math.hypot(b.cx - prev.cx, b.cy - prev.cy);
+        if (d <= bd) { bd = d; best = b; }
+      }
+      if (best) return best;
+    }
+    return list[0];
+  }
+
+  // -------------------------------------------------------------- tracker
+  function createTracker(p) {
+    p = Object.assign({}, params, p || {});
+    let last = null;            // {x, y, r} smoothed, mirrored normalized
+    let prevPx = null;          // {cx, cy} pixels, unmirrored, for nearest-to-prev
+    let lastSeenMs = null;
+    function update(img, nowMs) {
+      const W = img.width, H = img.height;
+      const b = pick(blobs(mask(img, target, p), W, H, p), prevPx, W);
+      if (b) {
+        prevPx = { cx: b.cx, cy: b.cy };
+        const x = 1 - b.cx / W, y = b.cy / H, r = b.r / H;   // mirrored to match the displayed video
+        if (!last) last = { x, y, r };
+        else { const a = p.smooth; last = { x: last.x + a * (x - last.x), y: last.y + a * (y - last.y), r: last.r + a * (r - last.r) }; }
+        lastSeenMs = nowMs;
+        return { x: last.x, y: last.y, r: last.r, visible: true, lostForMs: 0 };
+      }
+      const lost = lastSeenMs == null ? Infinity : nowMs - lastSeenMs;
+      if (last) return { x: last.x, y: last.y, r: last.r, visible: false, lostForMs: lost };
+      return { x: NaN, y: NaN, r: NaN, visible: false, lostForMs: lost };
+    }
+    function reset() { last = null; prevPx = null; lastSeenMs = null; }
+    return { update, reset, last: () => (last ? { ...last } : null) };
+  }
+
+  // -------------------------------------------------------------- geometry (pure)
+  // The cap sits on the chest. In the mirrored view the strumming hand is on the right, so the
+  // uke body (bridge) hangs below-right of the cap. Offsets scale with apparent cap size.
+  function placeFrame(anchor, base) {
+    const scale = Math.min(1.6, Math.max(0.6, anchor.r / R_REF));
+    return {
+      bridge: { x: anchor.x + 0.22 * scale, y: anchor.y + 0.20 * scale },
+      length: base.length * scale,
+      spacing: base.spacing * scale,
+      scale,
+    };
+  }
+
+  function drawMarker(ctx, a, w, h) {
+    if (!ctx || !a || !isFinite(a.x)) return;
+    const x = a.x * w, y = a.y * h, r = Math.max(6, a.r * h);
+    ctx.save();
+    ctx.strokeStyle = a.visible ? '#37d67a' : 'rgba(255,255,255,.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, r * 1.4, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.6, y); ctx.lineTo(x + r * 0.6, y);
+    ctx.moveTo(x, y - r * 0.6); ctx.lineTo(x, y + r * 0.6);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // -------------------------------------------------------------- V10 self-test
+  function makeFrame(W, H, shapes) {
+    const data = new Uint8ClampedArray(W * H * 4);
+    for (let i = 0; i < W * H; i++) { data[4 * i] = 120; data[4 * i + 1] = 120; data[4 * i + 2] = 120; data[4 * i + 3] = 255; }
+    const put = (x, y, c) => { if (x < 0 || y < 0 || x >= W || y >= H) return; const i = 4 * (y * W + x); data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; };
+    for (const s of shapes) {
+      if (s.type === 'disc') {
+        for (let y = Math.floor(s.cy - s.r); y <= Math.ceil(s.cy + s.r); y++)
+          for (let x = Math.floor(s.cx - s.r); x <= Math.ceil(s.cx + s.r); x++)
+            if ((x - s.cx) ** 2 + (y - s.cy) ** 2 <= s.r * s.r) put(x, y, s.c);
+      } else if (s.type === 'rect') {
+        for (let y = s.y0; y <= s.y1; y++) for (let x = s.x0; x <= s.x1; x++) put(x, y, s.c);
+      }
+    }
+    return { data, width: W, height: H };
+  }
+
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { pass = pass && !!ok; lines.push((ok ? 'PASS ' : 'FAIL ') + msg); };
+    const BLUE = [30, 80, 220], RED = [220, 40, 40];
+    const W = 160, H = 90;
+    const savedTarget = getTarget();
+    setTarget({ ...DEFAULT_TARGET });
+
+    const hsvBlue = rgbToHsv(0, 0, 255);
+    check(Math.abs(hsvBlue.h - 240) < 1e-9 && hsvBlue.s === 1 && hsvBlue.v === 1, `rgbToHsv(0,0,255) → h ${hsvBlue.h.toFixed(1)} s ${hsvBlue.s} v ${hsvBlue.v}`);
+    const capHsv = rgbToHsv(...BLUE);
+    check(hueDiff(capHsv.h, DEFAULT_TARGET.h) <= params.hueTol, `synthetic cap colour hue ${capHsv.h.toFixed(1)}° within ${params.hueTol}° of default target ${DEFAULT_TARGET.h}°`);
+
+    const frame = makeFrame(W, H, [
+      { type: 'disc', cx: 40, cy: 30, r: 6, c: BLUE },            // the cap
+      { type: 'disc', cx: 120, cy: 60, r: 1, c: BLUE },           // too small
+      { type: 'rect', x0: 90, y0: 40, x1: 150, y1: 80, c: BLUE }, // too large (61×41 = 2501 px > 288)
+      { type: 'disc', cx: 80, cy: 45, r: 6, c: RED },             // wrong colour
+    ]);
+    const m = mask(frame);
+    const at = (x, y) => m[y * W + x];
+    check(at(40, 30) === 1, 'mask: cap centre (40,30) is 1');
+    check(at(120, 40) === 1, 'mask: big blue rect (120,40) is 1 (colour matches, size filter is later)');
+    check(at(80, 45) === 0, 'mask: red disc (80,45) is 0');
+    check(at(10, 10) === 0, 'mask: grey background (10,10) is 0');
+
+    const bl = blobs(m, W, H);
+    check(bl.length === 1, `blobs: exactly one valid blob (got ${bl.length})`);
+    if (bl.length) {
+      const b = bl[0], expA = Math.PI * 36;
+      check(Math.abs(b.area - expA) / expA <= 0.15, `blobs: area ${b.area} within ±15% of π·36 = ${expA.toFixed(1)}`);
+      check(Math.abs(b.cx - 40) <= 1 && Math.abs(b.cy - 30) <= 1, `blobs: centroid (${b.cx.toFixed(2)}, ${b.cy.toFixed(2)}) within 1 px of (40,30)`);
+    }
+
+    const tr = createTracker();
+    const t1 = tr.update(frame, 0);
+    check(t1.visible && Math.abs(t1.x - 0.75) < 0.01 && Math.abs(t1.y - 30 / 90) < 0.01, `tracker: mirrored x ${t1.x.toFixed(3)} ≈ 0.750, y ${t1.y.toFixed(3)} ≈ 0.333, visible`);
+    check(Math.abs(t1.r - 6 / 90) < 0.01, `tracker: r ${t1.r.toFixed(4)} ≈ ${(6 / 90).toFixed(4)} (radius / frame height)`);
+
+    const empty = makeFrame(W, H, []);
+    let te = null;
+    for (let i = 1; i <= 3; i++) te = tr.update(empty, 400 * i);
+    check(te && !te.visible && te.lostForMs === 1200 && Math.abs(te.x - t1.x) < 1e-12, `tracker: after 3 empty frames visible=false, lostForMs ${te && te.lostForMs}, position held`);
+    check(te.lostForMs >= params.lostMs, `tracker: lostForMs ${te.lostForMs} ≥ lostMs ${params.lostMs} → integrator would freeze`);
+
+    // Nearest-to-prev: cap moved 5 px right, same-size decoy far away (decoy is first in area order if slightly bigger)
+    const frame2 = makeFrame(W, H, [
+      { type: 'disc', cx: 45, cy: 30, r: 6, c: BLUE },
+      { type: 'disc', cx: 130, cy: 75, r: 6.5, c: BLUE },
+    ]);
+    const bl2 = blobs(mask(frame2), W, H);
+    const chosen = pick(bl2, { cx: 40, cy: 30 }, W);
+    check(bl2.length === 2 && chosen && Math.abs(chosen.cx - 45) <= 1, `pick: nearest-to-prev chooses moved cap at cx ${chosen && chosen.cx.toFixed(1)} (decoy at 130 is larger)`);
+    check(pick(bl2, null, W).cx > 100, 'pick: without prev, the largest blob wins');
+    const tr2 = createTracker();
+    tr2.update(frame, 0);
+    const t2 = tr2.update(frame2, 33);
+    check(t2.visible && t2.x > 0.70 && t2.x < 0.75, `tracker: follows moved cap (x ${t2.x.toFixed(3)}, EMA toward 0.719) not the decoy`);
+
+    const base = { length: 0.55, spacing: 0.045 };
+    const p1 = placeFrame({ x: 0.5, y: 0.4, r: R_REF }, base);
+    check(Math.abs(p1.scale - 1) < 1e-12 && Math.abs(p1.bridge.x - 0.72) < 1e-12 && Math.abs(p1.bridge.y - 0.60) < 1e-12, `placeFrame: r = R_REF → scale 1, bridge (${p1.bridge.x.toFixed(2)}, ${p1.bridge.y.toFixed(2)})`);
+    check(placeFrame({ x: 0, y: 0, r: 0.001 }, base).scale === 0.6, 'placeFrame: tiny cap clamps scale to 0.6');
+    check(placeFrame({ x: 0, y: 0, r: 1 }, base).scale === 1.6, 'placeFrame: huge cap clamps scale to 1.6');
+    check(Math.abs(placeFrame({ x: 0, y: 0, r: R_REF * 1.2 }, base).length - 0.55 * 1.2) < 1e-12, 'placeFrame: length scales linearly with r');
+
+    // click-to-sample: mirrored click on the cap should return the cap's hue
+    const sampled = sampleColorAt(frame, 1 - 40 / 159, 30 / 89, 2);
+    check(sampled && hueDiff(sampled.h, capHsv.h) < 2, `sampleColorAt (mirrored coords) hue ${sampled && sampled.h.toFixed(1)}° ≈ cap ${capHsv.h.toFixed(1)}°`);
+
+    // timing
+    const tt = createTracker();
+    const t0 = Date.now();
+    const N = 200;
+    for (let i = 0; i < N; i++) tt.update(frame, i * 33);
+    const msPer = (Date.now() - t0) / N;
+    check(msPer < 3, `timing: ${msPer.toFixed(3)} ms per update at 160×90 (< 3 ms)`);
+
+    setTarget(savedTarget);
+    lines.unshift(pass ? 'V10 ANCHOR OK' : 'V10 ANCHOR FAILED');
+    return { pass, lines };
+  }
+
+  return { params, R_REF, DEFAULT_TARGET, rgbToHsv, hueDiff, sampleFrame, setTarget, getTarget, save, load,
+           sampleColorAt, mask, blobs, pick, createTracker, placeFrame, drawMarker, selfTest };
+})();
+
+
+// ==========================================================================
+// SECTION songs/  (src/songs.js)
+// ==========================================================================
+// ============================================================================
+// songs/  — learn-a-song: chord charts (no lyrics), practice/play-along session
+//           engine (pure, time passed in), and the bottom-strip renderer.
+// Depends on global Tuning (src/tuning.js). Pure parts run in node.
+// ============================================================================
+const Songs = (() => {
+  // --------------------------------------------------------------- song data
+  // Chord charts only. Chord progressions are not copyrightable; lyrics are, so
+  // none appear here. Beats are 4/4 quarter notes; each bar entry = one chord.
+  const RASPUTIN_SECTIONS = {
+    intro:  [{ chord: 'Am', beats: 4 }, { chord: 'Am', beats: 4 }, { chord: 'F', beats: 4 }, { chord: 'G', beats: 2 }, { chord: 'Am', beats: 2 }],
+    // original A / E7 replaced by Am / G so the song stays inside the four recognised chords
+    hey:    [{ chord: 'Am', beats: 4 }, { chord: 'Am', beats: 4 }, { chord: 'Am', beats: 2 }, { chord: 'G', beats: 2 }, { chord: 'F', beats: 2 }, { chord: 'G', beats: 2 }],
+    // original Dm → F, E7 → G
+    verse:  [{ chord: 'Am', beats: 8 }, { chord: 'F', beats: 4 }, { chord: 'G', beats: 2 }, { chord: 'Am', beats: 2 }],
+    chorus: [{ chord: 'Am', beats: 2 }, { chord: 'C', beats: 2 }, { chord: 'F', beats: 2 }, { chord: 'Am', beats: 2 }, { chord: 'G', beats: 2 }, { chord: 'F', beats: 2 }, { chord: 'Am', beats: 4 }],
+    bridge: [{ chord: 'Am', beats: 4 }, { chord: 'G', beats: 4 }, { chord: 'F', beats: 4 }, { chord: 'G', beats: 4 }, { chord: 'Am', beats: 4 }],
+    outro:  [{ chord: 'Am', beats: 8 }],
+  };
+  const sec = (name, repeat) => ({ name, repeat, bars: RASPUTIN_SECTIONS[name].map(b => ({ ...b })) });
+
+  const SONGS = [
+    {
+      id: 'rasputin',
+      title: 'Rasputin',
+      artist: 'Boney M.',
+      note: 'as heard in Dhurandhar: The Revenge · simplified to C G Am F',
+      bpm: 126,                       // the record sits around 126 BPM
+      strum: 'D DU D DU',
+      sections: [
+        sec('intro', 2), sec('hey', 2), sec('verse', 4), sec('chorus', 2),
+        sec('verse', 4), sec('chorus', 2), sec('bridge', 2), sec('chorus', 2), sec('outro', 1),
+      ],
+    },
+    {
+      id: 'four-chord-loop',
+      title: 'Four-chord loop (C G Am F)',
+      artist: 'warm-up',
+      note: 'the I–V–vi–IV loop behind hundreds of pop songs',
+      bpm: 100,
+      strum: 'D DU UDU',
+      sections: [{ name: 'loop', repeat: 4, bars: [{ chord: 'C', beats: 4 }, { chord: 'G', beats: 4 }, { chord: 'Am', beats: 4 }, { chord: 'F', beats: 4 }] }],
+    },
+  ];
+
+  const list = () => SONGS;
+  const get = id => SONGS.find(s => s.id === id) || null;
+
+  // Expand repeats into a linear list of entries (one chord for N beats each).
+  function flatten(song) {
+    const out = [];
+    song.sections.forEach((s, sectionIndex) => {
+      for (let r = 0; r < s.repeat; r++) {
+        s.bars.forEach((b, barIndex) => {
+          out.push({ chord: b.chord, beats: b.beats, section: s.name, sectionIndex, repeat: r, barIndex });
+        });
+      }
+    });
+    return out;
+  }
+
+  // --------------------------------------------------------------- session engine
+  const STRUM_DEBOUNCE_MS = 150;   // a 4-string rake spans ≤ 80 ms; anything closer is the same strum
+
+  function createSession(song, opts) {
+    opts = opts || {};
+    const entries = flatten(song);
+    const total = entries.length;
+    // cumulative beat offsets for play-along
+    const cum = new Array(total + 1); cum[0] = 0;
+    for (let i = 0; i < total; i++) cum[i + 1] = cum[i] + entries[i].beats;
+
+    let mode = opts.mode === 'playalong' ? 'playalong' : 'practice';
+    let bpm = opts.bpm || song.bpm || 120;
+    let index = 0, correct = 0, attempted = 0, done = false;
+    let lastStrumMs = -Infinity;
+    let startMs = null, lastBeat = -1, lastIndex = -1;
+    let markedIndex = -1;            // play-along: entry already credited
+
+    function reset() {
+      index = 0; correct = 0; attempted = 0; done = false;
+      lastStrumMs = -Infinity; startMs = null; lastBeat = -1; lastIndex = -1; markedIndex = -1;
+    }
+    function start(nowMs) { reset(); startMs = nowMs; }
+    function setMode(m) { mode = m === 'playalong' ? 'playalong' : 'practice'; reset(); }
+    function setBpm(b) { if (b > 0) bpm = b; }
+    function skip(d) {
+      if (mode === 'playalong' && startMs != null) {
+        // shift the start time so the clock lands at the beginning of the target entry
+        const target = Math.max(0, Math.min(total - 1, index + d));
+        const beatMs = 60000 / bpm;
+        startMs += (cum[index] - cum[target]) * beatMs;
+        return;
+      }
+      index = Math.max(0, Math.min(total, index + d));
+      done = index >= total;
+    }
+
+    function onStrum(chord, nowMs) {
+      nowMs = nowMs == null ? 0 : nowMs;
+      if (done) return { advanced: false, correct: false };
+      if (nowMs - lastStrumMs < STRUM_DEBOUNCE_MS) return { advanced: false, correct: false };
+      lastStrumMs = nowMs;
+      const ok = chord === entries[index].chord;
+      if (mode === 'practice') {
+        attempted++;
+        if (ok) { correct++; index++; if (index >= total) done = true; }
+        return { advanced: ok, correct: ok };
+      }
+      // play-along: credit the current entry once
+      if (ok && markedIndex !== index) { markedIndex = index; correct++; }
+      return { advanced: false, correct: ok };
+    }
+
+    // play-along clock. Returns {beat, bar, index}.
+    function tick(nowMs) {
+      if (mode !== 'playalong' || startMs == null || done) return { beat: false, bar: false, index };
+      const beatMs = 60000 / bpm;
+      const elapsedBeats = (nowMs - startMs) / beatMs;
+      const beatNo = Math.floor(elapsedBeats);
+      let i = index;
+      while (i < total && elapsedBeats >= cum[i + 1]) i++;
+      const bar = i !== lastIndex;
+      const beat = beatNo !== lastBeat;
+      lastBeat = beatNo; lastIndex = i;
+      index = i;
+      if (index >= total) { done = true; index = total; }
+      return { beat, bar, index };
+    }
+
+    function state() {
+      const cur = index < total ? entries[index] : null;
+      let att = attempted, pct;
+      if (mode === 'playalong') {
+        att = done ? total : Math.min(total, index + (startMs == null ? 0 : 1));
+      }
+      pct = att > 0 ? Math.round(100 * correct / att) : 0;
+      let beatInBar = null;
+      if (mode === 'playalong' && startMs != null && cur) {
+        const elapsedBeats = (lastBeatTime() - startMs) / (60000 / bpm);
+        beatInBar = Math.max(0, Math.floor(elapsedBeats - cum[index]));
+      }
+      return {
+        index, total, current: cur, upcoming: entries.slice(index + 1, index + 5),
+        done, score: { correct, attempted: att, percent: pct }, mode, bpm, beatInBar,
+        title: song.title, artist: song.artist, note: song.note, strum: song.strum,
+      };
+    }
+    // last tick time is not stored explicitly; reconstruct from lastBeat for the HUD
+    function lastBeatTime() { return startMs + (lastBeat < 0 ? 0 : lastBeat) * (60000 / bpm); }
+
+    return { state, onStrum, tick, start, reset, setMode, setBpm, skip, entries, song };
+  }
+
+  // --------------------------------------------------------------- renderer
+  const CSS = `
+    #song { position:absolute; left:0; right:0; bottom:0; height:150px; z-index:6; display:none;
+            background:linear-gradient(180deg, rgba(0,0,0,.55), rgba(0,0,0,.88)); color:#f4f4f4;
+            font:14px/1.35 system-ui, Segoe UI, sans-serif; box-sizing:border-box; padding:14px 20px; }
+    #song.on { display:grid; grid-template-columns: 1fr auto 1fr; align-items:center; gap:24px; }
+    #song .sg-left { min-width:0; }
+    #song .sg-title { font-size:18px; font-weight:700; }
+    #song .sg-artist { color:rgba(255,255,255,.6); }
+    #song .sg-note { color:rgba(255,255,255,.45); font-size:12px; margin-top:4px; }
+    #song .sg-meta { margin-top:8px; color:rgba(255,255,255,.7); font-size:12px; }
+    #song .sg-meta b { color:#f4f4f4; }
+    #song .sg-centre { text-align:center; min-width:180px; }
+    #song .sg-target { font-size:64px; font-weight:800; line-height:1; letter-spacing:-1px; color:#ffb74d; transition:color .08s; }
+    #song .sg-target.match { color:#37d67a; }
+    #song .sg-sub { color:rgba(255,255,255,.6); font-size:12px; margin-top:6px; }
+    #song .sg-right { text-align:right; min-width:0; }
+    #song .sg-next { display:flex; justify-content:flex-end; gap:10px; }
+    #song .sg-next span { display:inline-block; min-width:44px; padding:6px 8px; border-radius:6px;
+                          background:rgba(255,255,255,.1); font-size:20px; font-weight:600; text-align:center; }
+    #song .sg-next span:first-child { background:rgba(255,255,255,.2); }
+    #song .sg-strum { margin-top:8px; font:600 13px ui-monospace, Consolas, monospace; letter-spacing:2px; color:rgba(255,255,255,.75); }
+    #song .sg-progress { margin-top:4px; color:rgba(255,255,255,.6); font-size:12px; }
+    #song .sg-done { font-size:26px; font-weight:700; color:#37d67a; }
+  `;
+  let cssInjected = false;
+
+  function build(el) {
+    if (!cssInjected && typeof document !== 'undefined') {
+      const st = document.createElement('style'); st.textContent = CSS; document.head.appendChild(st); cssInjected = true;
+    }
+    el.innerHTML =
+      '<div class="sg-left"><div class="sg-title"></div><div class="sg-artist"></div><div class="sg-note"></div><div class="sg-meta"></div></div>' +
+      '<div class="sg-centre"><div class="sg-target"></div><div class="sg-sub"></div></div>' +
+      '<div class="sg-right"><div class="sg-next"></div><div class="sg-strum"></div><div class="sg-progress"></div></div>';
+    const q = c => el.querySelector('.' + c);
+    const ui = {
+      title: q('sg-title'), artist: q('sg-artist'), note: q('sg-note'), meta: q('sg-meta'),
+      target: q('sg-target'), sub: q('sg-sub'), next: q('sg-next'), strum: q('sg-strum'), progress: q('sg-progress'),
+      nextSpans: [], last: {},
+    };
+    for (let i = 0; i < 4; i++) { const s = document.createElement('span'); ui.next.appendChild(s); ui.nextSpans.push(s); }
+    el._songUI = ui;
+    return ui;
+  }
+  const setText = (node, key, ui, text) => { if (ui.last[key] !== text) { node.textContent = text; ui.last[key] = text; } };
+
+  function render(el, session, opts) {
+    if (!el) return;
+    const ui = el._songUI || build(el);
+    const s = session.state();
+    const rec = opts && opts.recognisedChord;
+    setText(ui.title, 'title', ui, s.title);
+    setText(ui.artist, 'artist', ui, s.artist || '');
+    setText(ui.note, 'note', ui, s.note || '');
+    const modeTxt = s.mode === 'practice' ? 'practice · strum the right chord to advance' : 'play-along · metronome at tempo';
+    const metaTxt = `${modeTxt} · ${s.bpm} BPM · M toggles mode · S closes`;
+    if (ui.last.meta !== metaTxt) { ui.meta.innerHTML = `<b>${s.mode === 'practice' ? 'Practice' : 'Play-along'}</b>${metaTxt.slice(s.mode === 'practice' ? 8 : 10)}`; ui.last.meta = metaTxt; }
+
+    if (s.done) {
+      setText(ui.target, 'target', ui, 'Done');
+      ui.target.classList.remove('match');
+      setText(ui.sub, 'sub', ui, `Song complete · ${s.score.percent}% correct · press S to restart`);
+      ui.sub.className = 'sg-sub sg-done';
+      ui.nextSpans.forEach(sp => { sp.textContent = ''; });
+      setText(ui.progress, 'progress', ui, `bar ${s.total} / ${s.total} · ${s.score.percent}% correct`);
+      return;
+    }
+    ui.sub.className = 'sg-sub';
+    const cur = s.current;
+    setText(ui.target, 'target', ui, cur.chord === 'open' ? 'open' : cur.chord);
+    const match = rec === cur.chord;
+    if (ui.last.match !== match) { ui.target.classList.toggle('match', match); ui.last.match = match; }
+    const beatTxt = s.mode === 'playalong' && s.beatInBar != null ? ` · beat ${Math.min(cur.beats, s.beatInBar + 1)}/${cur.beats}` : ` · ${cur.beats} beats`;
+    setText(ui.sub, 'sub', ui, `${cur.section}${beatTxt}`);
+    for (let i = 0; i < 4; i++) {
+      const n = s.upcoming[i];
+      const t = n ? n.chord : '';
+      if (ui.last['next' + i] !== t) { ui.nextSpans[i].textContent = t; ui.nextSpans[i].style.visibility = t ? 'visible' : 'hidden'; ui.last['next' + i] = t; }
+    }
+    setText(ui.strum, 'strum', ui, s.strum || '');
+    setText(ui.progress, 'progress', ui, `bar ${s.index + 1} / ${s.total} · ${s.score.percent}% correct`);
+  }
+
+  // --------------------------------------------------------------- V9 self-test
+  function selfTest() {
+    const lines = [];
+    let pass = true;
+    const check = (ok, msg) => { if (!ok) pass = false; lines.push((ok ? 'PASS ' : 'FAIL ') + msg); };
+
+    for (const song of SONGS) {
+      const flat = flatten(song);
+      const chords = new Set(flat.map(e => e.chord));
+      const unknown = [...chords].filter(c => !Tuning.CHORDS[c]);
+      check(unknown.length === 0, `${song.id}: every chord in Tuning.CHORDS (${[...chords].join(' ')})${unknown.length ? ' unknown: ' + unknown.join(' ') : ''}`);
+      for (const s of song.sections) {
+        const beats = s.bars.reduce((a, b) => a + b.beats, 0);
+        check(beats % 4 === 0, `${song.id}/${s.name}: ${beats} beats is a multiple of 4`);
+      }
+      const expectLen = song.sections.reduce((a, s) => a + s.repeat * s.bars.length, 0);
+      check(flat.length === expectLen, `${song.id}: flatten length ${flat.length} = Σ repeat×bars ${expectLen}`);
+
+      // practice: wrong chord never advances; exactly flat.length correct strums finish it
+      const p = createSession(song, { mode: 'practice' });
+      let t = 0, wrongAdvanced = false, strums = 0;
+      for (let i = 0; i < flat.length; i++) {
+        const wrong = flat[i].chord === 'C' ? 'G' : 'C';
+        t += 200; const r1 = p.onStrum(wrong, t); if (r1.advanced) wrongAdvanced = true;
+        t += 50;  const rd = p.onStrum(flat[i].chord, t);       // inside 150 ms debounce → ignored
+        if (rd.advanced) wrongAdvanced = true;
+        t += 200; const r2 = p.onStrum(flat[i].chord, t); strums++;
+        if (!r2.advanced) { pass = false; lines.push(`FAIL ${song.id}: correct strum at entry ${i} did not advance`); break; }
+      }
+      const ps = p.state();
+      check(!wrongAdvanced, `${song.id}: wrong-chord and debounced strums never advance`);
+      check(ps.done && ps.index === flat.length, `${song.id}: done after ${strums} correct strums (index ${ps.index}/${flat.length})`);
+      check(ps.score.correct === flat.length && ps.score.attempted === 2 * flat.length && ps.score.percent === 50,
+        `${song.id}: practice score ${ps.score.correct}/${ps.score.attempted} = ${ps.score.percent}%`);
+
+      // play-along at 120 BPM: bar boundaries at cumulative beats × 500 ms
+      const pa = createSession(song, { mode: 'playalong', bpm: 120 });
+      pa.start(1000);
+      let cumBeats = 0, expectedTimes = flat.map(e => { const tt = 1000 + cumBeats * 500; cumBeats += e.beats; return tt; });
+      const totalMs = cumBeats * 500;
+      const barTimes = [];
+      let credited = 0;
+      for (let now = 1000; now <= 1000 + totalMs + 20; now += 10) {
+        const r = pa.tick(now);
+        if (r.bar && r.index < flat.length) barTimes.push({ index: r.index, now });
+        if (r.bar && r.index < flat.length) { pa.onStrum(flat[r.index].chord, now); credited++; }
+      }
+      let timingOk = barTimes.length === flat.length;
+      for (const b of barTimes) if (Math.abs(b.now - expectedTimes[b.index]) > 10) timingOk = false;
+      check(timingOk, `${song.id}: play-along bar starts at cumulative beats×500 ms (${barTimes.length}/${flat.length} bars, ≤10 ms)`);
+      const pas = pa.state();
+      check(pas.done && pas.score.correct === flat.length && pas.score.percent === 100,
+        `${song.id}: play-along finished, score ${pas.score.correct}/${pas.score.attempted} = ${pas.score.percent}%`);
+      // second strum on the same entry must not double-credit
+      const pb = createSession(song, { mode: 'playalong', bpm: 120 }); pb.start(0); pb.tick(0);
+      pb.onStrum(flat[0].chord, 0); pb.onStrum(flat[0].chord, 400);
+      check(pb.state().score.correct === 1, `${song.id}: play-along credits an entry once (${pb.state().score.correct})`);
+    }
+    lines.unshift(pass ? 'V9 SONGS OK' : 'V9 SONGS FAILED');
+    return { pass, lines };
+  }
+
+  return { list, get, flatten, createSession, render, selfTest, STRUM_DEBOUNCE_MS };
+})();
+
+
+// ==========================================================================
+// SECTION main  (src/main.js)
+// ==========================================================================
+// ============================================================================
+// render/ + input/ + verify/ + main  — wiring for uke.html
+// Depends on: Tuning, AudioEngine, Tracking, Chord, UkeFrame, Strum, Annot, Anchor, Songs
+// ============================================================================
+const App = (() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), overlay = $('overlay'), ctx2d = overlay.getContext('2d');
+  const el = { chord: $('chord'), conf: $('conf').firstElementChild, pitch: $('pitch'), pos: $('pos'), debug: $('debug'),
+               status: $('status'), start: $('start'), startBtn: $('startBtn'), startNote: $('startNote'),
+               panel: $('panel'), panelBody: $('panelBody'), calib: $('calib'), help: $('help'), song: $('song') };
+
+  const state = {
+    started: false, cameraOn: false, trackingOn: false, debug: false,
+    chord: 'open', confidence: 0, method: 'rules', curls: null,
+    keyboardChord: null,            // Q/W/E/R override; O releases
+    sounding: null,                 // chord the engine is actually tuned to (after position gating)
+    lastPlucks: [],                 // for the debug HUD (string, when)
+    fps: 0, trackSource: '-',
+    fretting: null, strumming: null,   // hands in SCREEN-normalised coords (cover-mapped)
+    // position layer: fretting fingertips in instrument-local coords (index 1..4), match result, verdict
+    fretTips: null, match: null, coach: null, overNeck: false, positionOk: false,
+    position: null,                 // 'ok' | 'off' (over neck, fingers not on the dots) | 'away' (hand not over the neck)
+    lastStrumWrist: null,           // strumming wrist in local coords, to catch role swaps between hands
+    calibrating: null,
+    highlight: [false, false, false, false], highlightUntil: [0, 0, 0, 0],
+    helpOn: false,
+    song: null, songOn: false,      // Songs session
+    anchorOn: false, anchorArmed: false, anchor: null,   // blue-cap tracker
+    framePinned: false,             // anchor or C-recentre has placed the frame: resize must not move it
+    base: { length: 0.55, spacing: 0.05 },               // unscaled frame size from resize()
+    lastSpacing: 0,
+  };
+
+  const voter = Chord.createVoter({ window: 5, minVotes: 3, minConfidence: 0.5 });
+  let detector = null;
+  let anchorTracker = null;
+
+  // ---------------------------------------------------------------- helpers
+  const setStatus = s => { el.status.textContent = s; };
+  const currentChord = () => state.keyboardChord || state.chord || 'open';
+  const targetChord = () => (state.songOn && state.song && !state.song.state().done) ? state.song.state().current.chord : currentChord();
+
+  // Recognised shape → HUD label. The engine is tuned by applySounding(), not here.
+  function applyChord(name) {
+    el.chord.textContent = name;
+    el.chord.classList.toggle('stale', name === 'open' || name === 'mute');
+    applySounding();
+  }
+
+  // What actually sounds, layered like a real instrument:
+  //   keyboard override          → that chord (keyboard must always drive the app)
+  //   no camera                  → the recognised chord (nothing to gate on)
+  //   fretting hand off the neck → open strings (no fingers on the board = open)
+  //   over the neck, wrong spot  → all strings damped (ρ = 0.9): a thud, not the right notes
+  //   fingers on the dots        → the recognised chord
+  function soundingChord() {
+    if (state.keyboardChord) return state.keyboardChord;
+    if (!state.trackingOn) return state.chord || 'open';
+    if (!state.fretting || state.position === 'away') return 'open';
+    if (state.position === 'off') return 'mute';
+    return state.chord || 'open';
+  }
+  function applySounding() {
+    const name = soundingChord();
+    if (name !== state.sounding) { state.sounding = name; AudioEngine.setChord(name); }
+    const off = !state.keyboardChord && state.trackingOn && state.fretting && state.position === 'off';
+    el.chord.classList.toggle('off', !!off);
+    let msg = '', cls = '';
+    if (state.keyboardChord) { msg = 'keyboard override — O to release'; }
+    else if (!state.trackingOn) { msg = ''; }
+    else if (!state.fretting) { msg = 'no left hand — open strings'; }
+    else if (state.position === 'away') { msg = 'left hand off the fretboard — open strings'; cls = 'warn'; }
+    else if (state.position === 'off') { msg = 'fingers not on the dots — strings damped'; cls = 'warn'; }
+    else if (state.chord && state.chord !== 'open' && state.chord !== 'mute') { msg = `fingers in position — ${state.chord} will sound`; cls = 'ok'; }
+    if (el.pos) { el.pos.textContent = msg; el.pos.className = cls; }
+  }
+
+  // Fingertip landmark for finger n (1 index … 4 pinky) is 4n + 4.
+  const TIP_LM = [null, 8, 12, 16, 20];
+  const POS_WINDOW = 5, POS_MIN = 3;   // same majority as the chord voter: 3 of the last 5 frames
+  const neckVotes = [], posVotes = [];
+  function vote(buf, v, current) {
+    buf.push(!!v); if (buf.length > POS_WINDOW) buf.shift();
+    const yes = buf.filter(Boolean).length;
+    if (yes >= POS_MIN) return true;
+    if (buf.length - yes >= POS_MIN) return false;
+    return current;
+  }
+  // Position layer: is the fretting hand over the neck, and are its fingertips on the dots of the
+  // recognised chord? Runs every tracking frame after the frame may have moved (anchor).
+  const FRET_LOST_GRACE_MS = 300;   // a hand dropped for a few frames keeps its verdict; longer = really gone
+  let lastFrettingSeenMs = -Infinity;
+  function updatePosition(nowMs) {
+    const hand = state.fretting;
+    if (hand) lastFrettingSeenMs = nowMs;
+    else if (nowMs - lastFrettingSeenMs < FRET_LOST_GRACE_MS) return;
+    if (!hand) {
+      neckVotes.length = 0; posVotes.length = 0;
+      state.fretTips = null; state.match = null; state.coach = null; state.overNeck = false; state.positionOk = false; state.position = null;
+      applySounding();
+      return;
+    }
+    const tips = TIP_LM.map(i => (i == null ? null : UkeFrame.toLocal(hand.landmarks[i])));
+    state.fretTips = tips;
+    const fr = UkeFrame.get();
+    state.overNeck = vote(neckVotes, Annot.handOverNeck(tips.slice(1), UkeFrame.neckZone()), state.overNeck);
+    state.match = Annot.matchFingers(state.chord || 'open', tips, fr.length, fr.spacing);
+    state.positionOk = vote(posVotes, state.overNeck && state.match.allOk, state.positionOk);
+    // coaching compares against the song target when a song is on, else the recognised chord
+    const coachChord = targetChord();
+    state.coach = coachChord === (state.chord || 'open') ? state.match : Annot.matchFingers(coachChord, tips, fr.length, fr.spacing);
+    state.position = !state.overNeck ? 'away' : state.positionOk ? 'ok' : 'off';
+    applySounding();
+  }
+
+  function firePlucks(scheduled) {
+    // scheduled: [{string, velocity, when}] with `when` in AudioContext seconds
+    for (const p of scheduled) {
+      AudioEngine.pluck(p.string, p.velocity, p.when);
+      const delayMs = Math.max(0, (p.when - AudioEngine.now()) * 1000);
+      setTimeout(() => { state.highlightUntil[p.string] = performance.now() + 250; }, delayMs);
+    }
+    state.lastPlucks = scheduled.map(p => ({ string: p.string, when: p.when }));
+    // One strum event per batch feeds the song session (practice mode advances on the correct chord).
+    // The *sounding* chord is fed, so a right shape in the wrong place (damped) never advances a bar.
+    if (state.songOn && state.song) {
+      const r = state.song.onStrum(soundingChord(), performance.now());
+      if (r && r.advanced && state.song.state().done) setStatus('song complete — press S to restart');
+    }
+  }
+
+  function strumChord(dir) {
+    const frets = Tuning.CHORDS[soundingChord()] || Tuning.CHORDS.open;
+    firePlucks(Strum.keyboardStrum(frets, dir, 12, AudioEngine.now())); // 12 ms rake ≈ a relaxed hand
+  }
+
+  function rebuildDetector() {
+    const fr = UkeFrame.get();
+    // hysteresis band, speed gate, arming and minVelocity take the documented defaults in Strum.createDetector
+    detector = Strum.createDetector({ stringYs: UkeFrame.stringLocalYs(), zoneX: UkeFrame.strumZone(), spacing: fr.spacing, debounceMs: 40, maxJump: 0.4 });
+    state.lastSpacing = fr.spacing;
+    state.lastStrumWrist = null;
+  }
+
+  // The <video> uses object-fit: cover, so raw video-normalised coords (MediaPipe, cap tracker)
+  // must be mapped through the crop to line up with what is on screen.
+  function coverMap() {
+    const vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+    const sw = overlay.clientWidth || 16, sh = overlay.clientHeight || 9;
+    const s = Math.max(sw / vw, sh / vh);
+    const dw = vw * s, dh = vh * s, ox = (sw - dw) / 2, oy = (sh - dh) / 2;
+    return { toScreen: p => ({ x: (ox + p.x * dw) / sw, y: (oy + p.y * dh) / sh, z: p.z }), rScale: dh / sh };
+  }
+  function mapHand(hand, cm) {
+    return hand ? { ...hand, landmarks: hand.landmarks.map(cm.toScreen) } : null;
+  }
+
+  // ---------------------------------------------------------------- start
+  async function start() {
+    if (state.started) return;
+    state.started = true;
+    el.startBtn.disabled = true;
+    setStatus('starting audio…');
+    await AudioEngine.init();
+    applyChord('open');
+    resize();
+    rebuildDetector();
+    el.start.style.display = 'none';
+    requestAnimationFrame(renderLoop);
+
+    // Camera + tracking are best-effort; keyboard and mouse always work.
+    try {
+      setStatus('loading hand tracker…');
+      await Tracking.init({ onStatus: setStatus });
+      state.trackSource = Tracking.source || '-';
+      setStatus('starting camera…');
+      await Tracking.startCamera(video, { width: 1280, height: 720 });   // 16:9 so cover-crop is minimal on laptops
+      state.cameraOn = true;
+      state.trackingOn = true;
+      anchorTracker = Anchor.createTracker();
+      Tracking.onFrame(video, onTrack);
+      setStatus(`tracking via ${state.trackSource} · press B then click your blue cap to anchor the uke`);
+    } catch (e) {
+      setStatus('no camera/tracker — keyboard + mouse mode (' + (e && e.message || e) + ')');
+    }
+  }
+
+  // ---------------------------------------------------------------- tracking → chord + strum + anchor
+  function onTrack(result, nowMs) {
+    state.fps = result.fps;
+    const cm = coverMap();
+    state.fretting = mapHand(result.fretting, cm);
+    state.strumming = mapHand(result.strumming, cm);
+
+    if (state.calibrating && result.fretting) {
+      Chord.calib.addFrame(result.fretting.landmarks);        // raw coords: Chord normalises its own frame
+    }
+
+    // Chord recognition from the fretting hand shape
+    if (result.fretting && !state.calibrating) {
+      const r = Chord.classify(result.fretting.landmarks);
+      state.curls = r.curls; state.method = r.method;
+      const v = voter.push(r);
+      state.confidence = v.confidence || 0;
+      if (v.chord && v.chord !== state.chord) {
+        state.chord = v.chord;
+        if (!state.keyboardChord) applyChord(v.chord);
+      }
+    }
+
+    // Blue-cap anchor → instrument position and size
+    if (state.anchorOn && anchorTracker) {
+      const img = Anchor.sampleFrame(video, Anchor.params.scanW, Anchor.params.scanH);
+      if (img) {
+        const a = anchorTracker.update(img, nowMs);
+        const sp = cm.toScreen({ x: a.x, y: a.y });
+        state.anchor = { x: sp.x, y: sp.y, r: a.r * cm.rScale, visible: a.visible, lostForMs: a.lostForMs };
+        if (a.visible || a.lostForMs < Anchor.params.lostMs) {
+          const g = Anchor.placeFrame(state.anchor, state.base);
+          UkeFrame.set({ bridge: g.bridge, length: g.length, spacing: g.spacing });
+          state.framePinned = true;
+          if (Math.abs(g.spacing - state.lastSpacing) > 0.02 * state.lastSpacing) rebuildDetector();
+        }
+      }
+    }
+
+    // Position layer (after the frame may have moved)
+    updatePosition(nowMs);
+
+    // Strum detection from the strumming index tip (landmark 8)
+    if (state.strumming) {
+      const lm = state.strumming.landmarks;
+      // A wrist cannot translate 12% of the frame in one camera frame; if it did, the "strumming hand"
+      // is a different hand (role swap / duplicate detection) and the ring buffer must not bridge them.
+      const wristL = UkeFrame.toLocal(lm[0]);
+      if (state.lastStrumWrist && Math.hypot(wristL.x - state.lastStrumWrist.x, wristL.y - state.lastStrumWrist.y) > WRIST_JUMP_MAX) detector.reset();
+      state.lastStrumWrist = wristL;
+      // A strumming index finger is extended; a fist, or a face detected as a hand, is not.
+      if (Chord.curls(lm).index > STRUM_INDEX_MAX_CURL) {
+        detector.reset();
+      } else {
+        const tip = lm[8];
+        const local = UkeFrame.toLocal({ x: tip.x, y: tip.y });
+        const plucks = detector.push({ x: local.x, y: local.y, t: nowMs });
+        if (plucks.length) firePlucks(Strum.schedule(plucks, AudioEngine.now(), nowMs));
+      }
+    } else {
+      detector.reset();
+      state.lastStrumWrist = null;
+    }
+  }
+  const WRIST_JUMP_MAX = 0.12;        // local units (frame heights) per tracking frame
+  const STRUM_INDEX_MAX_CURL = 0.5;   // Chord.curls: 0 = straight, 1 = folded into the palm
+
+  // ---------------------------------------------------------------- render
+  function resize() {
+    overlay.width = overlay.clientWidth * devicePixelRatio;
+    overlay.height = overlay.clientHeight * devicePixelRatio;
+    // Isotropic geometry: with aspect set, lengths are in frame-heights, so a −15° neck is really 15° on screen.
+    const aspect = overlay.clientWidth / Math.max(1, overlay.clientHeight);
+    // Sized like a soprano uke held at chest height: neck ≈ 0.66 frame-heights, string spacing 0.05
+    // (fingertip-sized cells so position play is feasible), body right of centre at chest height.
+    // y = 0.62, not 0.80: at 0.80 the strings sat at lap height, right where a seated player's
+    // right hand rests and where hands enter the frame.
+    state.base = { length: Math.min(0.66, 0.38 * aspect), spacing: 0.05 };
+    const geo = { aspect, length: state.base.length, spacing: state.base.spacing };
+    if (!state.framePinned) Object.assign(geo, { bridge: { x: 0.64, y: 0.62 }, angleDeg: -18 });   // anchor / C own the placement otherwise
+    UkeFrame.set(geo);
+    if (detector) rebuildDetector();
+  }
+  window.addEventListener('resize', resize);
+
+  function renderLoop() {
+    const w = overlay.width, h = overlay.height, now = performance.now();
+    ctx2d.clearRect(0, 0, w, h);
+    for (let i = 0; i < 4; i++) state.highlight[i] = state.highlightUntil[i] > now;
+    UkeFrame.draw(ctx2d, w, h, { highlight: state.highlight });
+    const position = (state.trackingOn && state.fretting && !state.keyboardChord) ? state.position : null;
+    Annot.drawInstrument(ctx2d, w, h, { chord: targetChord(), recognised: currentChord(), highlight: state.highlight, position });
+    if (position) {
+      const hc = state.fretting ? UkeFrame.toLocal(handCentre(state.fretting)) : null;
+      Annot.drawCoaching(ctx2d, w, h, { chord: targetChord(), match: state.coach, tips: state.fretTips, overNeck: state.overNeck, handCentre: hc });
+    }
+    if (state.fretting) Tracking.drawLandmarks(ctx2d, state.fretting, w, h, '#4fc3f7');
+    if (state.strumming) Tracking.drawLandmarks(ctx2d, state.strumming, w, h, '#ffb74d');
+    if (state.anchorOn && state.anchor) Anchor.drawMarker(ctx2d, state.anchor, w, h);
+
+    el.conf.style.width = Math.round(100 * Math.min(1, state.confidence)) + '%';
+    el.conf.style.background = state.confidence >= 0.5 ? 'var(--ok)' : 'var(--accent)';
+
+    const lr = AudioEngine.liveReadout && AudioEngine.liveReadout();
+    if (lr && lr.measuredHz) {
+      const ok = Math.abs(lr.cents) <= 3;
+      el.pitch.innerHTML = `target <b>${lr.targetHz.toFixed(2)} Hz</b> · measured <b>${lr.measuredHz.toFixed(2)} Hz</b> · ` +
+        `<span class="${ok ? 'ok' : 'bad'}">${lr.cents >= 0 ? '+' : ''}${lr.cents.toFixed(1)} cents</span> · ${lr.note || ''}`;
+    }
+
+    if (state.helpOn) Annot.renderHelp(el.help, { recognised: currentChord(), target: state.songOn ? targetChord() : null });
+    if (state.songOn && state.song) {
+      if (state.song.state().mode === 'playalong') state.song.tick(now);
+      Songs.render(el.song, state.song, { recognisedChord: currentChord() });
+      updateSongHint(targetChord(), currentChord(), position);
+    }
+
+    if (state.debug) {
+      const c = state.curls, a = state.anchor, m = state.match;
+      el.debug.textContent =
+        `fps ${state.fps.toFixed(0)}   src ${state.trackSource}   video ${video.videoWidth}x${video.videoHeight}\n` +
+        `method ${state.method}   kb ${state.keyboardChord || '-'}   target ${targetChord()}   sounding ${state.sounding}\n` +
+        (c ? `curl idx ${c.index.toFixed(2)} mid ${c.middle.toFixed(2)} rng ${c.ring.toFixed(2)} pky ${c.pinky.toFixed(2)}  thr ${Chord.params.downThreshold}\n` : '') +
+        `position ${state.position || '-'}  overNeck ${state.overNeck}  ` +
+        (m && m.dots.length ? `dn ${m.dots.map(d => 'f' + d.finger + ':' + (Number.isFinite(d.dn) ? d.dn.toFixed(2) : '∞')).join(' ')}` : 'no dots') +
+        `  strum armed ${detector && detector.isArmed ? detector.isArmed() : '-'}  v ${detector ? detector.lastVelocity().toFixed(2) : '-'}\n` +
+        (a ? `anchor ${a.visible ? 'seen' : 'lost ' + a.lostForMs.toFixed(0) + 'ms'} x ${a.x.toFixed(3)} y ${a.y.toFixed(3)} r ${a.r.toFixed(4)}\n` : '') +
+        `last plucks ${state.lastPlucks.map(p => p.string + '@' + p.when.toFixed(3)).join(' ')}\n` +
+        `frame ${JSON.stringify(UkeFrame.get())}`;
+    }
+    requestAnimationFrame(renderLoop);
+  }
+
+  // ---------------------------------------------------------------- calibration flow (key K)
+  async function calibrate() {
+    if (state.calibrating || !state.trackingOn) { setStatus('calibration needs the camera'); return; }
+    const labels = ['C', 'G', 'Am', 'F', 'open'];
+    el.calib.classList.add('on');
+    for (const label of labels) {
+      el.calib.querySelector('.big').textContent = label;
+      for (let s = 3; s >= 1; s--) {              // 3 s per shape, first second is "get ready"
+        el.calib.querySelector('.count').textContent = s;
+        if (s === 2) { Chord.calib.begin(label); state.calibrating = label; }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      state.calibrating = null;
+      Chord.calib.end();
+    }
+    el.calib.classList.remove('on');
+    Chord.calib.save();
+    voter.reset();
+    const r = Chord.selfTest();
+    showPanel(r.pass, r.lines);
+    setStatus('calibration saved — recognition now uses your hand');
+  }
+
+  // ---------------------------------------------------------------- song mode (key S)
+  function toggleSong() {
+    if (!state.songOn) {
+      if (!state.song || state.song.state().done) {
+        state.song = Songs.createSession(Songs.get('rasputin'), { mode: 'practice' });
+        state.song.start(performance.now());
+      }
+      state.songOn = true; el.song.classList.add('on'); $('stage').classList.add('song-on');
+      setStatus('song: Rasputin (practice) — strum the shown chord to advance · M toggles play-along');
+    } else {
+      state.songOn = false; el.song.classList.remove('on'); $('stage').classList.remove('song-on');
+    }
+  }
+
+  // "How to play it" hint inside the song panel: mini diagram + the hand rule + what the camera sees.
+  // Centroid of the four finger MCPs (5, 9, 13, 17): where the hand "is" for the coaching arrow.
+  function handCentre(hand) {
+    const p = [5, 9, 13, 17].map(i => hand.landmarks[i]);
+    return { x: (p[0].x + p[1].x + p[2].x + p[3].x) / 4, y: (p[0].y + p[1].y + p[2].y + p[3].y) / 4 };
+  }
+
+  let hint = null, hintChord = null;
+  function updateSongHint(target, recognised, position) {
+    if (!hint) {
+      hint = document.createElement('div');
+      hint.id = 'songHint';
+      hint.innerHTML = '<div class="sh-row"><canvas width="128" height="160" style="width:64px;height:80px"></canvas>' +
+        '<div class="sh-text"><div class="sh-how"></div><div class="sh-steps">1 · left hand up, palm to camera<br>2 · hold the shape until this turns green<br>3 · sweep right index finger down across the strings</div></div></div>' +
+        '<div class="sh-seen"></div>';
+      const st = document.createElement('style');
+      st.textContent = '#songHint{margin-top:4px}#songHint .sh-row{display:flex;gap:12px;align-items:flex-start}#songHint .sh-how{font-weight:700;color:var(--fg);margin-bottom:4px}' +
+        '#songHint .sh-steps{font-size:12px;color:var(--muted);line-height:1.5}#songHint .sh-seen{margin-top:8px;font-size:12px;color:var(--accent)}#songHint .sh-seen.ok{color:var(--ok)}';
+      document.head.appendChild(st);
+      const centre = el.song.querySelector('.sg-centre');
+      (centre || el.song).appendChild(hint);
+    }
+    if (target !== hintChord) {
+      hintChord = target;
+      Annot.drawMiniDiagram(hint.querySelector('canvas'), target);
+      const rule = Tuning.CURL_RULE[target];
+      hint.querySelector('.sh-how').textContent = `How: ${rule ? rule.text : ''} — keep the other fingers straight`;
+    }
+    const seen = hint.querySelector('.sh-seen');
+    const shapeOk = recognised === target;
+    const ok = shapeOk && position !== 'off' && position !== 'away';
+    seen.textContent = !shapeOk ? `camera sees: ${recognised} — adjust your fingers`
+      : position === 'away' ? `shape is ${target} — move your left hand onto the fretboard`
+      : position === 'off' ? `shape is ${target} — put your fingers on the dots`
+      : `✓ ${target} in position — strum now`;
+    seen.classList.toggle('ok', ok);
+  }
+
+  // ---------------------------------------------------------------- self-test runner (V key / ?selftest=1)
+  async function selfTest() {
+    document.title = 'RUNNING';           // headless-run.js polls the title
+    showPanel(null, ['running…']);
+    const results = [];
+    const safe = (name, fn) => { try { results.push(fn()); } catch (e) { results.push({ pass: false, lines: [name + ' FAILED — ' + (e && e.message || e)] }); } };
+    safe('V1', () => Tuning.selfTest());
+    safe('V4', () => Strum.selfTest());
+    safe('V8', () => Chord.selfTest());
+    safe('V9', () => Songs.selfTest());
+    safe('V10', () => Anchor.selfTest());
+    safe('V11', () => Annot.selfTest());
+    try { results.push(await AudioEngine.selfTestV2()); }
+    catch (e) { results.push({ pass: false, lines: ['V2 PITCH FAILED — ' + (e && e.message || e)] }); }
+    const pass = results.every(r => r.pass);
+    const lines = results.flatMap(r => [...r.lines, '']);
+    showPanel(pass, lines);
+    $('out').textContent = (pass ? 'ALL CHECKS PASS\n' : 'CHECKS FAILED\n') + lines.join('\n');
+    document.title = (pass ? 'PASS ' : 'FAIL ') + 'Air Ukulele';
+    return pass;
+  }
+
+  function showPanel(pass, lines) {
+    el.panel.classList.add('on');
+    const banner = pass === null ? '' : `<div class="banner ${pass ? 'pass' : 'fail'}">${pass ? 'ALL CHECKS PASS' : 'CHECKS FAILED'}</div>`;
+    el.panelBody.innerHTML = banner + '<pre>' + lines.map(esc).join('\n') + '</pre>';
+  }
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+  // ---------------------------------------------------------------- input: keyboard + mouse
+  const CHORD_KEYS = { q: 'C', w: 'G', e: 'Am', r: 'F' };
+  window.addEventListener('keydown', ev => {
+    if (ev.repeat) return;
+    const k = ev.key.toLowerCase();
+    if (k === 'v') { if (el.panel.classList.contains('on')) el.panel.classList.remove('on'); else selfTest(); return; }
+    if (k === 'escape') { el.panel.classList.remove('on'); return; }
+    if (k === 'd') { state.debug = !state.debug; el.debug.classList.toggle('on', state.debug); return; }
+    if (ev.key === '?' || k === '/') { state.helpOn = !state.helpOn; el.help.classList.toggle('on', state.helpOn); $('stage').classList.toggle('help-on', state.helpOn); return; }
+    if (!state.started) return;
+    if (k >= '1' && k <= '4') { firePlucks([{ string: 4 - Number(k), velocity: 0.8, when: AudioEngine.now() }]); }  // 4 = G top, 1 = A bottom
+    else if (k === ' ') { ev.preventDefault(); strumChord(ev.shiftKey ? -1 : +1); }
+    else if (CHORD_KEYS[k]) { state.keyboardChord = CHORD_KEYS[k]; applyChord(CHORD_KEYS[k]); }
+    else if (k === 'o') { state.keyboardChord = null; applyChord(state.chord || 'open'); }
+    else if (k === 'k') { calibrate(); }
+    else if (k === 's') { toggleSong(); }
+    else if (k === 'm' && state.song) { const m = state.song.state().mode === 'practice' ? 'playalong' : 'practice'; state.song.setMode(m); state.song.start(performance.now()); setStatus('song mode: ' + m); }
+    else if (k === 'n' && state.song) { state.song.skip(+1); }
+    else if (k === 'b') {
+      if (!state.cameraOn) { setStatus('cap anchor needs the camera'); return; }
+      if (state.anchorOn) { state.anchorOn = false; state.anchorArmed = false; setStatus('cap anchor off — instrument stays where it is'); }
+      else { state.anchorArmed = true; setStatus('click on your blue pen cap…'); }
+    }
+    else if (k === 'c') {
+      if (state.fretting && state.strumming) { UkeFrame.recenter(state.fretting.landmarks[0], state.strumming.landmarks[8]); state.framePinned = true; rebuildDetector(); setStatus('recentred'); }
+    }
+  });
+  // Shift+R clears calibration only with Shift to avoid accidents
+  window.addEventListener('keydown', ev => { if (ev.key === 'R' && ev.shiftKey) { Chord.calib.clear(); voter.reset(); setStatus('calibration cleared — rules mode'); } });
+
+  // Mouse: armed → sample the cap colour; otherwise a primary-button drag = strumming fingertip through
+  // the same detector. The drag ends on ANY of pointerup / pointercancel / lost capture / window blur /
+  // button no longer held, so a stuck "down" can never turn hovering into strumming.
+  let mouseDown = false;
+  const endDrag = () => { if (mouseDown && detector) detector.reset(); mouseDown = false; };
+  overlay.addEventListener('pointerdown', ev => {
+    if (state.anchorArmed) {
+      const img = Anchor.sampleFrame(video, Anchor.params.scanW, Anchor.params.scanH);
+      if (!img) { setStatus('no video frame yet'); return; }
+      // Undo the cover-crop to get video-normalised coords (mirrored) for the sampler
+      const cm = coverMap();
+      const vw = video.videoWidth, vh = video.videoHeight, sw = overlay.clientWidth, sh = overlay.clientHeight;
+      const s = Math.max(sw / vw, sh / vh), dw = vw * s, dh = vh * s, ox = (sw - dw) / 2, oy = (sh - dh) / 2;
+      const nx = (ev.clientX - ox) / dw, ny = (ev.clientY - oy) / dh;
+      const hsv = Anchor.sampleColorAt(img, nx, ny, 2);
+      Anchor.setTarget(hsv); Anchor.save();
+      anchorTracker.reset();
+      state.anchorArmed = false; state.anchorOn = true;
+      setStatus(`cap colour sampled (hue ${hsv.h.toFixed(0)}°) — instrument now follows the cap · B to stop`);
+      return;
+    }
+    if (ev.button !== 0 || !ev.isPrimary) return;          // left button only; no right-click / second touch
+    mouseDown = true; detector && detector.reset();
+    try { overlay.setPointerCapture(ev.pointerId); } catch (_) { /* not all pointers support capture */ }
+  });
+  window.addEventListener('pointerup', endDrag);
+  overlay.addEventListener('pointercancel', endDrag);
+  overlay.addEventListener('lostpointercapture', endDrag);
+  window.addEventListener('blur', endDrag);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) endDrag(); });
+  overlay.addEventListener('pointermove', ev => {
+    if (!mouseDown || !detector) return;
+    if (!(ev.buttons & 1)) { endDrag(); return; }           // button released without us hearing about it
+    const local = UkeFrame.toLocal({ x: ev.clientX / overlay.clientWidth, y: ev.clientY / overlay.clientHeight });
+    const plucks = detector.push({ x: local.x, y: local.y, t: performance.now() });
+    if (plucks.length) firePlucks(Strum.schedule(plucks, AudioEngine.now(), performance.now()));
+  });
+
+  // ---------------------------------------------------------------- boot
+  el.startBtn.addEventListener('click', start);
+  if (location.protocol === 'file:') el.startNote.textContent = 'Running from file:// — hand tracker loads from the internet. For offline use run run.bat.';
+  Chord.calib.load();
+  Anchor.load();
+  if (new URLSearchParams(location.search).get('selftest') === '1') {
+    // Self-test needs no camera and no user gesture (OfflineAudioContext).
+    el.start.style.display = 'none';
+    selfTest();
+  }
+  // onTrack / soundingChord / coverMap are exposed so a headless smoke test can drive the live path with synthetic hands.
+  return { state, start, selfTest, calibrate, toggleSong, updateSongHint, onTrack, soundingChord, coverMap };
+})();
+
+
+// Expose the sections for DevTools / screenshot tooling (module scope is otherwise private).
+window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Anchor, Songs };
+</script>
+</body>
+</html>

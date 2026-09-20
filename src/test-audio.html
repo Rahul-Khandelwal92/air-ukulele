@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>RUNNING</title></head>
+<body>
+<pre id="out">running V2...</pre>
+<script src="tuning.js"></script>
+<script src="audio.js"></script>
+<script>
+(async () => {
+  const out = document.getElementById('out');
+  try {
+    const t1 = Tuning.selfTest();
+    const t2 = await AudioEngine.selfTestV2();
+    out.textContent = t1.lines.join('\n') + '\n\n' + t2.lines.join('\n');
+    document.title = (t1.pass && t2.pass) ? 'PASS' : 'FAIL';
+  } catch (e) {
+    out.textContent = 'ERROR ' + (e && e.stack || e);
+    document.title = 'FAIL';
+  }
+  document.body.setAttribute('data-done', '1');
+})();
+</script>
+</body></html>

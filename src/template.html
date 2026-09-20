@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Ukulele</title>
+<!-- ============================================================================
+     1. <style>  — design system: dark glass surfaces, one amber accent, 8-pt grid.
+     ============================================================================ -->
+<style>
+  :root {
+    --bg: #07080a;
+    --fg: #f6f4ef;
+    --muted: rgba(255,255,255,.6);
+    --faint: rgba(255,255,255,.32);
+    --accent: #f5b74a;
+    --accent-ink: #1a1206;
+    --ok: #4cd977;
+    --bad: #ff5f6d;
+    --glass: rgba(12,14,18,.55);
+    --glass-strong: rgba(12,14,18,.78);
+    --line: rgba(255,255,255,.08);
+    --line-strong: rgba(255,255,255,.14);
+    --radius: 16px;
+    --radius-sm: 10px;
+    --sans: "Segoe UI Variable Display", "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+    --shadow: 0 8px 32px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); overflow: hidden; -webkit-font-smoothing: antialiased; }
+  #stage { position: fixed; inset: 0; }
+  #video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #video { object-fit: cover; transform: scaleX(-1); filter: brightness(.65) saturate(.85); }
+  #overlay { object-fit: cover; }
+
+  .glass { background: var(--glass); backdrop-filter: blur(14px) saturate(1.1); -webkit-backdrop-filter: blur(14px) saturate(1.1);
+           border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+
+  /* ---- brand wordmark ---- */
+  #brand { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
+  #brand .mark { display: flex; align-items: center; gap: 10px; }
+  #brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #ffd27a, var(--accent) 60%, #d98f1f);
+                 box-shadow: 0 2px 10px rgba(245,183,74,.35); position: relative; flex: none; }
+  #brand .logo::before, #brand .logo::after { content: ""; position: absolute; left: 7px; right: 7px; height: 1.5px; background: var(--accent-ink); opacity: .85; border-radius: 1px; }
+  #brand .logo::before { top: 10px; } #brand .logo::after { top: 16px; }
+  #brand .name { font-size: 20px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; }
+  #brand .name b { font-weight: 700; color: var(--accent); }
+  #brand .tag { font-size: 11.5px; color: var(--muted); letter-spacing: .04em; padding-left: 38px; }
+
+  /* ---- HUD (top-left) ---- */
+  #hud { position: absolute; top: 24px; left: 24px; z-index: 5; pointer-events: none; display: flex; flex-direction: column; gap: 12px; width: min(360px, 34vw); min-width: 300px; }
+  #hud .card { padding: 16px 20px 18px; }
+  #hud .label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); margin-bottom: 2px; }
+  #chord { font-size: clamp(64px, 9vw, 120px); font-weight: 700; line-height: 1.02; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+           padding: 4px 6px 6px 2px; min-height: 1.02em; color: var(--fg); text-shadow: 0 2px 18px rgba(0,0,0,.4); transition: color .15s ease; }
+  #chord.stale { color: var(--muted); }
+  #chord.off { color: var(--accent); }
+  #pos { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 1.3em; line-height: 1.3; }
+  #pos.ok { color: var(--ok); } #pos.warn { color: var(--accent); }
+  .confrow { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .confrow .label { margin: 0; flex: none; }
+  #conf { flex: 1; height: 6px; background: rgba(255,255,255,.12); border-radius: 3px; overflow: hidden; }
+  #conf > i { display: block; height: 100%; width: 0; background: var(--ok); border-radius: 3px; transition: width .12s linear, background .2s ease; }
+  #pitch { padding: 10px 16px; font-size: 13px; color: var(--muted); border-radius: 999px; display: inline-flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-variant-numeric: tabular-nums; }
+  #pitch b { color: var(--fg); font-weight: 600; }
+  #pitch .ok { color: var(--ok); font-weight: 600; } #pitch .bad { color: var(--bad); font-weight: 600; }
+
+  /* ---- right-side panels filled by other modules ---- */
+  #help { position: absolute; top: 24px; right: 24px; width: 300px; max-height: calc(100% - 200px); overflow: auto; z-index: 6; padding: 14px; display: none;
+          background: var(--glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); scrollbar-width: thin; }
+  #help.on { display: block; }
+  /* Song helper lives in the right column (never over the instrument). Stacks under #help when both are open. */
+  #stage #song { position: absolute; left: auto; right: 24px; top: 24px; bottom: 72px; width: 300px; height: auto; z-index: 6; display: none; padding: 16px 18px; overflow: auto; scrollbar-width: thin;
+          background: var(--glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  #stage #song.on { display: flex; flex-direction: column; justify-content: flex-start; align-items: stretch; gap: 14px; }
+  #stage.help-on #song.on { top: calc(46% + 12px); }
+  #stage.song-on #help { max-height: calc(46% - 24px); }
+  #stage #song .sg-left, #stage #song .sg-centre, #stage #song .sg-right { text-align: left; min-width: 0; }
+  #stage #song .sg-centre { padding: 10px 0 6px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  #stage #song .sg-target { font-size: clamp(56px, 6vw, 84px); letter-spacing: -.02em; }
+  #stage #song .sg-target.match { color: var(--ok); }
+  #stage #song .sg-next { justify-content: flex-start; flex-wrap: wrap; gap: 8px; }
+  #stage #song .sg-title { font-size: 17px; }
+  #stage #song .sg-meta, #stage #song .sg-note, #stage #song .sg-progress, #stage #song .sg-sub { color: var(--muted); }
+
+  /* ---- debug (bottom-right) ---- */
+  #debug { position: absolute; right: 24px; bottom: 72px; z-index: 5; display: none; padding: 10px 14px; font: 11.5px/1.55 var(--mono); color: var(--muted); white-space: pre; text-align: left;
+           background: var(--glass-strong); border: 1px solid var(--line); border-radius: var(--radius-sm); max-width: 46vw; overflow: hidden; }
+  #debug.on { display: block; }
+
+  /* ---- bottom bar: status pill + keycap chips ---- */
+  #status { position: absolute; left: 24px; bottom: 24px; z-index: 5; max-width: 30vw; padding: 7px 12px 7px 10px; font-size: 12px; color: var(--muted); border-radius: 999px;
+            background: var(--glass); border: 1px solid var(--line); display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 rgba(245,183,74,.6); animation: pulse 1.8s ease-out infinite; flex: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(245,183,74,.55); } 70% { box-shadow: 0 0 0 7px rgba(245,183,74,0); } 100% { box-shadow: 0 0 0 0 rgba(245,183,74,0); } }
+  #keys { position: absolute; right: 24px; bottom: 24px; z-index: 5; display: flex; gap: 6px; flex-wrap: nowrap; padding: 6px 8px; border-radius: 999px;
+          background: var(--glass); border: 1px solid var(--line); max-width: calc(68vw - 48px); overflow: hidden; }
+  #keys .kc { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 3px 8px 3px 3px; border-radius: 999px; white-space: nowrap; }
+  #keys kbd { font: 11px/1 var(--mono); color: var(--fg); background: rgba(255,255,255,.1); border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 6px; padding: 4px 6px; min-width: 22px; text-align: center; }
+  @media (max-width: 1400px) { #keys .kc.opt { display: none; } }
+
+  /* ---- start overlay ---- */
+  #start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 10; background: rgba(4,5,7,.45); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+  #start .card { width: min(520px, calc(100vw - 48px)); padding: 36px 40px 32px; display: flex; flex-direction: column; align-items: flex-start; gap: 14px; background: var(--glass-strong); }
+  #start #brand { margin-bottom: 4px; }
+  #start #brand .name { font-size: 34px; letter-spacing: .1em; }
+  #start #brand .logo { width: 40px; height: 40px; border-radius: 11px; }
+  #start #brand .logo::before, #start #brand .logo::after { left: 10px; right: 10px; height: 2px; } #start #brand .logo::before { top: 15px; } #start #brand .logo::after { top: 23px; }
+  #start #brand .tag { padding-left: 50px; font-size: 12.5px; }
+  #start p { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; max-width: 46ch; }
+  #start button { margin-top: 8px; font: 600 16px var(--sans); letter-spacing: .01em; padding: 14px 26px; border-radius: 12px; border: 0; cursor: pointer; color: var(--accent-ink);
+                  background: linear-gradient(180deg, #ffd27a, var(--accent)); box-shadow: 0 6px 24px rgba(245,183,74,.3), inset 0 1px 0 rgba(255,255,255,.35); transition: transform .12s ease, box-shadow .12s ease; }
+  #start button:hover { transform: translateY(-1px); box-shadow: 0 10px 28px rgba(245,183,74,.38), inset 0 1px 0 rgba(255,255,255,.35); }
+  #start button:disabled { opacity: .6; cursor: default; transform: none; }
+  #start #startNote { font-size: 12px; color: var(--faint); }
+  #start #startNote:empty { display: none; }
+  #start .hint { display: flex; gap: 16px; font-size: 12px; color: var(--faint); margin-top: 2px; }
+  #start .hint span::before { content: "•"; color: var(--accent); margin-right: 6px; }
+
+  /* ---- self-test / report panel ---- */
+  #panel { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(4,5,7,.6); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  #panel.on { display: flex; }
+  #panel .sheet { position: relative; width: min(960px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: auto; padding: 24px 28px 28px; background: var(--glass-strong); scrollbar-width: thin; }
+  #panel .close { position: absolute; top: 18px; right: 22px; color: var(--muted); font-size: 12px; }
+  #panel pre { font: 12px/1.5 var(--mono); margin: 0; white-space: pre-wrap; color: rgba(255,255,255,.82); }
+  #panel .banner { font: 700 22px var(--sans); padding: 10px 16px; border-radius: 12px; margin: 0 0 16px; display: inline-block; letter-spacing: .01em; }
+  #panel .banner.pass { background: var(--ok); color: #05210f; } #panel .banner.fail { background: var(--bad); color: #2a0509; }
+
+  /* ---- calibration overlay ---- */
+  #calib { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); z-index: 15; display: none; text-align: center; padding: 36px 56px 28px; min-width: 340px; background: var(--glass-strong); }
+  #calib.on { display: block; }
+  #calib .step { font-size: 11px; text-transform: uppercase; letter-spacing: .16em; color: var(--muted); margin-bottom: 6px; }
+  #calib .big { font-size: 128px; font-weight: 700; line-height: 1; letter-spacing: -.02em; }
+  #calib .count { font-size: 44px; font-weight: 600; color: var(--accent); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  #calib p { color: var(--muted); margin: 10px 0 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="hud">
+    <div id="brand">
+      <div class="mark"><span class="logo"></span><span class="name">Air <b>Ukulele</b></span></div>
+      <div class="tag">webcam · physically modelled · Claude Build Day</div>
+    </div>
+    <div class="card glass">
+      <div class="label">Chord</div>
+      <div id="chord" class="stale">—</div>
+      <div class="confrow"><span class="label">confidence</span><div id="conf"><i></i></div></div>
+      <div id="pos"></div>
+    </div>
+    <div id="pitch" class="glass">pluck a string to see pitch</div>
+  </div>
+
+  <div id="debug"></div>
+  <div id="help"></div>
+  <div id="song"></div>
+
+  <div id="calib" class="glass">
+    <div class="step">Calibration · hold the shape</div>
+    <div class="big">C</div>
+    <div class="count">3</div>
+    <p>make the chord shape with your left hand</p>
+  </div>
+
+  <div id="status">idle</div>
+  <div id="keys">
+    <span class="kc"><kbd>1–4</kbd>pluck</span>
+    <span class="kc"><kbd>Space</kbd>strum</span>
+    <span class="kc"><kbd>Q W E R</kbd>chords</span>
+    <span class="kc opt"><kbd>O</kbd>open</span>
+    <span class="kc"><kbd>?</kbd>help</span>
+    <span class="kc"><kbd>S</kbd>song</span>
+    <span class="kc opt"><kbd>M</kbd>mode</span>
+    <span class="kc"><kbd>B</kbd>cap anchor</span>
+    <span class="kc"><kbd>K</kbd>calibrate</span>
+    <span class="kc opt"><kbd>C</kbd>recentre</span>
+    <span class="kc opt"><kbd>D</kbd>debug</span>
+    <span class="kc"><kbd>V</kbd>self-test</span>
+  </div>
+
+  <div id="start">
+    <div class="card glass">
+      <div id="brand">
+        <div class="mark"><span class="logo"></span><span class="name">Air <b>Ukulele</b></span></div>
+        <div class="tag">webcam · physically modelled · Claude Build Day</div>
+      </div>
+      <p>Play a ukulele in the air. Your left hand makes the chord shape, your right index finger strums the strings on screen. Every note is synthesised from a physical string model and checked against real ukulele pitch.</p>
+      <button id="startBtn">Start — camera + sound</button>
+      <div class="hint"><span>Nothing is recorded or uploaded</span><span>Keyboard works without a camera</span></div>
+      <p id="startNote"></p>
+    </div>
+  </div>
+
+  <div id="panel"><div class="sheet glass"><span class="close">press V or Esc to close</span><div id="panelBody"></div></div></div>
+  <pre id="out" hidden></pre>
+</div>
+<script type="module">
+/*__SECTIONS__*/
+// Expose the sections for DevTools / screenshot tooling (module scope is otherwise private).
+window.__uke = { App, UkeFrame, Strum, Tuning, Chord, AudioEngine, Tracking, Annot, Anchor, Songs };
+</script>
+</body>
+</html>
