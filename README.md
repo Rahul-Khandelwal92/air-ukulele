@@ -116,3 +116,7 @@ pitch.md              the two-minute demo script
 ```
 
 No frameworks, no audio samples, one external dependency.
+
+## Licence
+
+MIT. See `LICENSE`. The files in `vendor/` are Google MediaPipe (`@mediapipe/tasks-vision`), redistributed under their own Apache 2.0 licence.
